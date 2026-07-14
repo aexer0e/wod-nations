@@ -362,6 +362,32 @@ input[type="range"]::-moz-range-thumb {
   image-rendering: pixelated;
 }
 
+.city-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.city-overlay.is-hidden { display: none; }
+
+.city-marker { shape-rendering: geometricPrecision; }
+.city-marker.city-red { color: #b30000; }
+.city-marker.city-blue { color: #2700b3; }
+.city-flag-pole {
+  fill: #000;
+  shape-rendering: crispEdges;
+}
+
+.city-flag-pennant {
+  fill: currentColor;
+  stroke: #000;
+  stroke-width: 1px;
+  stroke-linejoin: miter;
+}
+
 .objective-overlay {
   position: absolute;
   inset: 0;
@@ -505,6 +531,176 @@ input[type="range"]::-moz-range-thumb {
   font-size: 0.78rem;
   color: var(--ink-soft);
 }
+
+/* ---------- Analytics (momentum chart + snapshot log) ---------- */
+
+.analytics { display: flex; flex-direction: column; gap: 18px; }
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  border-bottom: 2px dashed rgba(43, 42, 51, 0.25);
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+}
+
+.panel-head h2 {
+  border-bottom: none;
+  padding-bottom: 0;
+  margin: 0;
+}
+
+.chart-status {
+  font-size: 0.8rem;
+  font-weight: 800;
+  color: var(--ink-soft);
+}
+
+.chart-status.lead-red { color: var(--red-deep); }
+.chart-status.lead-blue { color: var(--blue-deep); }
+
+.table-note {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.panel-sub {
+  margin: 0 0 10px;
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+}
+
+.chart-wrap { position: relative; }
+
+#chart-svg { display: block; width: 100%; }
+
+.chart-empty { font: 700 14px var(--font-body); fill: var(--ink-soft); }
+.chart-grid { stroke: rgba(43, 42, 51, 0.12); }
+.chart-mid { stroke: rgba(43, 42, 51, 0.42); stroke-dasharray: 6 4; }
+.chart-grid-label, .chart-axis-label { font: 700 11px var(--font-body); fill: var(--ink-soft); }
+
+.chart-area-red { fill: var(--red); opacity: 0.07; }
+.chart-area-blue { fill: var(--blue); opacity: 0.07; }
+
+.chart-line {
+  fill: none;
+  stroke-width: 2.5px;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart-line-red { stroke: var(--red); }
+.chart-line-blue { stroke: var(--blue); }
+
+.chart-marker { stroke: var(--gold); stroke-width: 2.5px; }
+.chart-hover-line { stroke: rgba(43, 42, 51, 0.4); stroke-dasharray: 3 3; }
+
+.chart-dot { stroke: var(--card); stroke-width: 1.5px; }
+.chart-dot-red { fill: var(--red); }
+.chart-dot-blue { fill: var(--blue); }
+
+.chart-pulse {
+  fill: none;
+  stroke-width: 2px;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: chartPulse 1.8s ease-out infinite;
+}
+
+.chart-pulse-red { stroke: var(--red); }
+.chart-pulse-blue { stroke: var(--blue); }
+
+@keyframes chartPulse {
+  0% { opacity: 0.8; transform: scale(0.45); }
+  80%, 100% { opacity: 0; transform: scale(1.4); }
+}
+
+.chart-end-label { font: 800 12px var(--font-body); }
+.chart-end-label.red { fill: var(--red-deep); }
+.chart-end-label.blue { fill: var(--blue-deep); }
+
+.chart-tooltip {
+  position: absolute;
+  top: 8px;
+  pointer-events: none;
+  background: rgba(255, 253, 246, 0.96);
+  border: 2px solid var(--line);
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  line-height: 1.4;
+  box-shadow: var(--shadow);
+  white-space: nowrap;
+  z-index: 2;
+}
+
+.chart-tooltip .tt-time { color: var(--ink-soft); font-size: 0.72rem; }
+.chart-tooltip .tt-red { color: var(--red-deep); }
+.chart-tooltip .tt-blue { color: var(--blue-deep); }
+
+/* Snapshot log */
+
+.table-scroll {
+  max-height: 430px;
+  overflow: auto;
+  border: 2px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.snap-table {
+  width: 100%;
+  min-width: 900px;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.snap-table th,
+.snap-table td {
+  padding: 7px 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.snap-table th.num,
+.snap-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.snap-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #f3ecd9;
+  border-bottom: 2px solid var(--line);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--ink-soft);
+}
+
+.snap-table tbody tr {
+  cursor: pointer;
+  border-top: 1px solid rgba(43, 42, 51, 0.1);
+}
+
+.snap-table tbody tr:hover { background: #fbf5e3; }
+
+.snap-table tbody tr.is-current {
+  background: rgba(240, 169, 46, 0.18);
+  box-shadow: inset 3px 0 0 var(--gold);
+}
+
+.cell-red { color: var(--red-deep); font-weight: 700; }
+.cell-blue { color: var(--blue-deep); font-weight: 700; }
+.cell-flat { color: var(--ink-soft); }
+.city-count-cell { white-space: nowrap; }
 
 /* ---------- Footer ---------- */
 

@@ -9,6 +9,7 @@ Data comes from the [wod-nations-map worker](https://wod-nations-map.moreofdots.
 - `index.html`, `styles.css`, `app.js` — the whole app
 - `assets/world_map.png` — terrain image (1920×1080)
 - `assets/playable-mask.bitset.zlib` + `assets/playable-mask.meta.json` — static playable-area bitset used to decode `playable-bitset-zlib-v1` snapshots
+- `assets/city-points.json` — 295 static city coordinates in the game's 9600×5400 world space; flag ownership is sampled from the selected snapshot
 - `.nojekyll` — tells GitHub Pages to serve files as-is
 
 Both snapshot encodings are supported: `playable-bitset-zlib-v1` (compact) and the legacy `raw-u8-zlib-v1`. Decoded overlays are cached in memory by `mapHash`.

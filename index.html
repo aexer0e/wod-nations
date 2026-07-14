@@ -78,12 +78,24 @@
             <input type="checkbox" id="show-objectives" checked autocomplete="off" />
             <span>Objectives</span>
           </label>
+          <label class="toolbar-check">
+            <input type="checkbox" id="show-cities" checked autocomplete="off" />
+            <span>Cities</span>
+          </label>
         </div>
 
         <div class="viewport" id="viewport">
           <div class="stage" id="stage">
             <canvas id="map-canvas" width="1920" height="1080"></canvas>
           </div>
+          <svg class="city-overlay" id="city-overlay" aria-hidden="true">
+            <defs>
+              <symbol id="city-flag" overflow="visible">
+                <rect class="city-flag-pole" x="-1.25" y="-18" width="2.5" height="20"></rect>
+                <path class="city-flag-pennant" d="M1.25 -17.5 L14 -12.5 L1.25 -7.5 Z"></path>
+              </symbol>
+            </defs>
+          </svg>
           <svg class="objective-overlay" id="objective-overlay" aria-hidden="true"></svg>
           <div class="map-loading" id="map-loading" hidden>
             <span class="loading-dots"><i></i><i></i><i></i></span>
@@ -128,6 +140,46 @@
         </section>
       </aside>
     </div>
+
+
+      <section class="card panel table-card">
+        <div class="panel-head">
+          <h2>🧾 Snapshot Log</h2>
+          <span class="table-note">Newest first · Δ columns compare with the previous snapshot · click a row to view it</span>
+        </div>
+        <div class="table-scroll">
+          <table class="snap-table">
+            <thead>
+              <tr>
+                <th class="num">#</th>
+                <th>Captured</th>
+                <th class="num">Red %</th>
+                <th class="num">Blue %</th>
+                <th class="num" title="Lead in percentage points">Lead (pp)</th>
+                <th class="num" title="Change in territory share vs the previous snapshot, in percentage points">Δ Share (pp)</th>
+                <th class="num" title="Net land that changed hands vs the previous snapshot">Δ Land</th>
+                <th class="num" title="Cities controlled by each faction">Cities (R / B)</th>
+                <th class="num" title="Net city-control change versus the previous snapshot">Δ Cities</th>
+              </tr>
+            </thead>
+            <tbody id="snap-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+    <!-- Campaign analytics -->
+    <section class="analytics" aria-label="Campaign analytics">
+      <section class="card panel chart-card">
+        <div class="panel-head">
+          <h2>📈 Momentum</h2>
+          <span class="chart-status" id="chart-status"></span>
+        </div>
+        <p class="panel-sub">Share of claimed territory over time — hover to inspect, click to jump the map to that moment.</p>
+        <div class="chart-wrap" id="chart-wrap">
+          <svg id="chart-svg" role="img" aria-label="Territory share over time"></svg>
+          <div class="chart-tooltip" id="chart-tooltip" hidden></div>
+        </div>
+      </section>
+    </section>
   </main>
 
   <footer class="site-footer">
