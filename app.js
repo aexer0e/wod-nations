@@ -212,7 +212,7 @@ function updateObjectiveView() {
 }
 
 function formatPct(value) {
-  return `${(value * 100).toFixed(1)}%`;
+  return `${(value * 100).toFixed(3)}%`;
 }
 
 function updateStats(entry) {
