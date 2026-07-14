@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>War of Dots — Nations Campaign Map</title>
+  <meta name="description" content="Live campaign map for the War of Dots Nations event. Watch the Red Empire and the Blue Republic battle for territory, replay the war so far, and read the latest war report." />
+  <meta property="og:title" content="War of Dots — Nations Campaign Map" />
+  <meta property="og:description" content="Live territory map and timeline replay for the War of Dots Nations event." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='38' cy='52' r='24' fill='%23d94141'/%3E%3Ccircle cx='66' cy='52' r='24' fill='%233f6ce0' fill-opacity='0.9'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Pixelify+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 100 100" aria-hidden="true">
+          <circle cx="36" cy="52" r="26" fill="#d94141" />
+          <circle cx="66" cy="52" r="26" fill="#3f6ce0" fill-opacity="0.92" />
+        </svg>
+        <div class="brand-text">
+          <h1>War of Dots</h1>
+          <p>Nations Campaign Map</p>
+        </div>
+      </div>
+      <div class="status-chip" id="status-chip" title="Data freshness">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Connecting…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="page">
+    <div class="error-banner" id="error-banner" hidden></div>
+
+    <!-- Territory control -->
+    <section class="battle-card card" aria-label="Territory control">
+      <div class="faction faction-red">
+        <span class="faction-dot red"></span>
+        <div class="faction-info">
+          <span class="faction-name">Red Empire</span>
+          <span class="faction-count" id="red-count">—</span>
+        </div>
+        <span class="faction-pct" id="red-pct">—</span>
+      </div>
+      <div class="battle-bar" role="img" aria-label="Territory control bar" id="battle-bar">
+        <div class="bar-red" id="bar-red"></div>
+        <div class="bar-blue" id="bar-blue"></div>
+        <div class="bar-center-tick" aria-hidden="true"></div>
+      </div>
+      <div class="faction faction-blue">
+        <span class="faction-pct" id="blue-pct">—</span>
+        <div class="faction-info">
+          <span class="faction-name">Blue Republic</span>
+          <span class="faction-count" id="blue-count">—</span>
+        </div>
+        <span class="faction-dot blue"></span>
+      </div>
+    </section>
+
+    <div class="layout">
+      <!-- Map -->
+      <section class="map-card card">
+        <div class="map-toolbar">
+          <div class="toolbar-group">
+            <button class="btn btn-icon" id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+            <button class="btn btn-icon" id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+            <button class="btn" id="zoom-reset" title="Fit map to view">Fit</button>
+          </div>
+          <div class="toolbar-group">
+            <label class="slider-label" for="overlay-alpha">Territory</label>
+            <input type="range" id="overlay-alpha" min="15" max="100" value="55" autocomplete="off" title="Territory overlay opacity" />
+          </div>
+          <label class="toolbar-check">
+            <input type="checkbox" id="show-objectives" checked autocomplete="off" />
+            <span>Objectives</span>
+          </label>
+        </div>
+
+        <div class="viewport" id="viewport">
+          <div class="stage" id="stage">
+            <canvas id="map-canvas" width="1920" height="1080"></canvas>
+          </div>
+          <svg class="objective-overlay" id="objective-overlay" aria-hidden="true"></svg>
+          <div class="map-loading" id="map-loading" hidden>
+            <span class="loading-dots"><i></i><i></i><i></i></span>
+            <span>Decoding battlefield…</span>
+          </div>
+        </div>
+
+        <div class="timeline">
+          <button class="btn btn-icon" id="play-btn" title="Play timeline (Space)" aria-label="Play timeline">▶</button>
+          <select id="play-speed" class="btn" autocomplete="off" title="Playback speed">
+            <option value="1000">1×</option>
+            <option value="500" selected>2×</option>
+            <option value="240">4×</option>
+            <option value="120">8×</option>
+          </select>
+          <input type="range" id="timeline-slider" min="0" max="0" value="0" step="1" autocomplete="off" aria-label="Timeline position" />
+          <div class="timeline-meta">
+            <span id="timeline-label">—</span>
+            <span class="timeline-pos" id="timeline-pos"></span>
+          </div>
+          <button class="btn" id="load-older" hidden title="Fetch older snapshots">⏪ Older</button>
+        </div>
+      </section>
+
+      <!-- Side panel -->
+      <aside class="side">
+        <section class="card panel">
+          <h2>📜 War Report</h2>
+          <p class="news" id="news-text">Loading dispatches…</p>
+        </section>
+
+        <section class="card panel">
+          <h2>🗺️ Legend</h2>
+          <ul class="legend">
+            <li><span class="swatch" style="background:#d94141"></span> Red Empire territory</li>
+            <li><span class="swatch" style="background:#3f6ce0"></span> Blue Republic territory</li>
+            <li><span class="swatch swatch-star" style="color:#d94141">★</span> Red Empire objective</li>
+            <li><span class="swatch swatch-star" style="color:#3f6ce0">★</span> Blue Republic objective</li>
+            <li><span class="swatch swatch-terrain"></span> Terrain</li>
+          </ul>
+          <p class="hint">Scroll to zoom, drag to pan. Use the arrow keys to step through time and the space key to play.</p>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <p>Fan-made live map for the <strong>War of Dots</strong> Nations event · a new snapshot is captured every 30 minutes.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

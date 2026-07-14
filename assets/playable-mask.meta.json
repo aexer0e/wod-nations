@@ -1,0 +1,10 @@
+{
+  "encoding": "pixel-bitset-zlib-v1",
+  "width": 1920,
+  "height": 1080,
+  "bitOrder": "least-significant-bit-first",
+  "playablePixels": 983237,
+  "decompressedBytes": 259200,
+  "compressedBytes": 26831,
+  "sha256": "130d7bbb22013920afede1383987c1dc130ca9f91077d2a5b53ffbd4595840d0"
+}
