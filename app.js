@@ -1,5 +1,4 @@
-/* War of Dots — Nations campaign map frontend.
- * Static site; all data comes from the public snapshot API. */
+/* War of Dots — Nations campaign map frontend. */
 "use strict";
 
 const API = "https://wod-nations-map.moreofdots.workers.dev";
@@ -11,10 +10,20 @@ const RED_RGB = [217, 65, 65];
 const BLUE_RGB = [63, 108, 224];
 const CACHE_LIMIT = 30; // decoded overlay canvases kept in memory
 const POLL_MS = 5 * 60 * 1000;
+const SESSION_KEY = "wod-nations-access-session";
+
+let accessToken = readSessionToken();
+let appStarted = false;
 
 const $ = (id) => document.getElementById(id);
 
 const els = {
+  accessGate: $("access-gate"),
+  accessForm: $("access-form"),
+  accessCode: $("access-code"),
+  accessSubmit: $("access-submit"),
+  accessError: $("access-error"),
+  logoutBtn: $("logout-btn"),
   statusDot: $("status-dot"),
   statusText: $("status-text"),
   errorBanner: $("error-banner"),
@@ -88,9 +97,53 @@ const state = {
 
 /* ---------- Fetch and decode helpers ---------- */
 
+function readSessionToken() {
+  try { return localStorage.getItem(SESSION_KEY) ?? ""; } catch { return ""; }
+}
+
+function saveSessionToken(token) {
+  accessToken = token;
+  try {
+    if (token) localStorage.setItem(SESSION_KEY, token);
+    else localStorage.removeItem(SESSION_KEY);
+  } catch { /* storage may be unavailable; the in-memory session still works */ }
+}
+
+function showAccessGate(message = "") {
+  saveSessionToken("");
+  document.body.classList.add("auth-locked");
+  els.accessGate.hidden = false;
+  els.accessError.textContent = message;
+  els.accessError.hidden = !message;
+  els.accessCode.value = "";
+  setTimeout(() => els.accessCode.focus(), 0);
+}
+
+function hideAccessGate() {
+  document.body.classList.remove("auth-locked");
+  els.accessGate.hidden = true;
+  els.accessError.hidden = true;
+}
+
+async function authenticatedFetch(url, init = {}) {
+  const target = new URL(url, location.href);
+  const headers = new Headers(init.headers);
+  if (target.origin === new URL(API).origin && accessToken) {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+  }
+  const resp = await fetch(target, { ...init, headers });
+  if (resp.status === 401 && target.origin === new URL(API).origin) {
+    showAccessGate("Your access session expired. Enter the code again.");
+  }
+  return resp;
+}
+
 async function fetchJSON(url) {
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
+  const resp = await authenticatedFetch(url);
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => null);
+    throw new Error(body?.error || `HTTP ${resp.status} for ${url}`);
+  }
   return resp.json();
 }
 
@@ -282,7 +335,7 @@ function getDecoded(row) {
     return cached;
   }
   const promise = (async () => {
-    const bytes = await inflate(await fetch(new URL(row.mapUrl, API)));
+    const bytes = await inflate(await authenticatedFetch(new URL(row.mapUrl, API)));
     let built;
     if (row.encoding === "playable-bitset-zlib-v1") {
       built = buildCompact(row, bytes, state.mask);
@@ -899,7 +952,7 @@ async function computeStats(row) {
       return;
     } catch { /* decode failed — fall through to a direct fetch */ }
   }
-  const bytes = await inflate(await fetch(new URL(row.mapUrl, API)));
+  const bytes = await inflate(await authenticatedFetch(new URL(row.mapUrl, API)));
   if (row.encoding === "playable-bitset-zlib-v1") {
     const { red, blue } = countCompact(row, bytes);
     setStat(row.mapHash, red, blue, countCompactCities(row, bytes));
@@ -1715,6 +1768,75 @@ async function loadTerrain() {
   return image;
 }
 
+function setupAccessControls() {
+  els.accessForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    els.accessSubmit.disabled = true;
+    els.accessSubmit.textContent = "Checking…";
+    els.accessError.hidden = true;
+    try {
+      const resp = await fetch(`${API}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: els.accessCode.value }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        let message = body.error || "Could not verify the access code.";
+        if (resp.status === 401 && Number.isInteger(body.attemptsRemaining)) {
+          message += ` ${body.attemptsRemaining} attempt${body.attemptsRemaining === 1 ? "" : "s"} remaining.`;
+        } else if (resp.status === 429 && Number.isFinite(body.retryAfter)) {
+          const minutes = Math.max(1, Math.ceil(body.retryAfter / 60));
+          message += ` Try again in about ${minutes} minute${minutes === 1 ? "" : "s"}.`;
+        }
+        throw new Error(message);
+      }
+      saveSessionToken(body.token);
+      hideAccessGate();
+      if (appStarted) {
+        location.reload();
+        return;
+      }
+      appStarted = true;
+      await init();
+    } catch (error) {
+      els.accessError.textContent = error.message || "Could not verify the access code.";
+      els.accessError.hidden = false;
+      els.accessCode.select();
+    } finally {
+      els.accessSubmit.disabled = false;
+      els.accessSubmit.textContent = "Unlock map";
+    }
+  });
+
+  els.logoutBtn.addEventListener("click", async () => {
+    try {
+      await authenticatedFetch(`${API}/auth/logout`, { method: "POST" });
+    } finally {
+      saveSessionToken("");
+      location.reload();
+    }
+  });
+}
+
+async function bootstrap() {
+  setupAccessControls();
+  if (!accessToken) {
+    showAccessGate();
+    return;
+  }
+  try {
+    await fetchJSON(`${API}/auth/session`);
+    hideAccessGate();
+    appStarted = true;
+    await init();
+  } catch (error) {
+    showAccessGate(error.message === "A valid access session is required."
+      ? "Your access session expired. Enter the code again."
+      : "Could not verify your saved session. Enter the code again.");
+  }
+}
+
 async function init() {
   if (typeof DecompressionStream === "undefined") {
     showError("This browser does not support DecompressionStream, which is needed to decode the map. Please use a current browser.");
@@ -1763,4 +1885,4 @@ async function init() {
   setInterval(renderStatus, 30 * 1000);
 }
 
-init();
+bootstrap();

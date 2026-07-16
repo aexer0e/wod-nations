@@ -13,7 +13,24 @@
   <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=Pixelify+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
-<body>
+<body class="auth-locked">
+  <section class="access-gate" id="access-gate" aria-labelledby="access-title">
+    <form class="access-card card" id="access-form">
+      <svg class="access-mark" viewBox="0 0 100 100" aria-hidden="true">
+        <circle cx="36" cy="52" r="26" fill="#d94141" />
+        <circle cx="66" cy="52" r="26" fill="#3f6ce0" fill-opacity="0.92" />
+      </svg>
+      <p class="access-eyebrow">Private campaign map</p>
+      <h1 id="access-title">Enter access code</h1>
+      <p class="access-copy">Use the code shared with you to view the live map.</p>
+      <label for="access-code">Access code</label>
+      <input id="access-code" name="code" type="password" autocomplete="current-password" maxlength="256" required />
+      <button class="btn access-submit" id="access-submit" type="submit">Unlock map</button>
+      <p class="access-error" id="access-error" role="alert" hidden></p>
+      <p class="access-note">Ten incorrect attempts from the same network will pause new attempts for one hour.</p>
+    </form>
+  </section>
+
   <header class="site-header">
     <div class="header-inner">
       <div class="brand">
@@ -26,9 +43,12 @@
           <p>Nations Campaign Map</p>
         </div>
       </div>
-      <div class="status-chip" id="status-chip" title="Data freshness">
-        <span class="status-dot" id="status-dot"></span>
-        <span id="status-text">Connecting…</span>
+      <div class="header-actions">
+        <div class="status-chip" id="status-chip" title="Data freshness">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Connecting…</span>
+        </div>
+        <button class="btn" id="logout-btn" type="button">Lock map</button>
       </div>
     </div>
   </header>
