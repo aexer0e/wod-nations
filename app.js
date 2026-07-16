@@ -14,6 +14,7 @@ const SESSION_KEY = "wod-nations-access-session";
 
 let accessToken = readSessionToken();
 let appStarted = false;
+let accessGateActive = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -110,17 +111,22 @@ function saveSessionToken(token) {
 }
 
 function showAccessGate(message = "") {
-  saveSessionToken("");
-  document.body.classList.add("auth-locked");
+  const alreadyActive = accessGateActive;
+  accessGateActive = true;
+  if (accessToken) saveSessionToken("");
+  document.documentElement.dataset.accessState = "locked";
   els.accessGate.hidden = false;
   els.accessError.textContent = message;
   els.accessError.hidden = !message;
-  els.accessCode.value = "";
-  setTimeout(() => els.accessCode.focus(), 0);
+  if (!alreadyActive) {
+    els.accessCode.value = "";
+    setTimeout(() => els.accessCode.focus(), 0);
+  }
 }
 
 function hideAccessGate() {
-  document.body.classList.remove("auth-locked");
+  accessGateActive = false;
+  document.documentElement.dataset.accessState = "authenticated";
   els.accessGate.hidden = true;
   els.accessError.hidden = true;
 }
@@ -1825,16 +1831,9 @@ async function bootstrap() {
     showAccessGate();
     return;
   }
-  try {
-    await fetchJSON(`${API}/auth/session`);
-    hideAccessGate();
-    appStarted = true;
-    await init();
-  } catch (error) {
-    showAccessGate(error.message === "A valid access session is required."
-      ? "Your access session expired. Enter the code again."
-      : "Could not verify your saved session. Enter the code again.");
-  }
+  hideAccessGate();
+  appStarted = true;
+  await init();
 }
 
 async function init() {
