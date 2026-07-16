@@ -75,18 +75,26 @@
             <input type="range" id="overlay-alpha" min="15" max="100" value="55" autocomplete="off" title="Territory overlay opacity" />
           </div>
           <label class="toolbar-check">
-            <input type="checkbox" id="show-objectives" checked autocomplete="off" />
-            <span>Objectives</span>
-          </label>
-          <label class="toolbar-check">
             <input type="checkbox" id="show-cities" checked autocomplete="off" />
             <span>Cities</span>
           </label>
+          <label class="toolbar-check" title="Show objective markers and their active fighting fronts">
+            <input type="checkbox" id="show-objectives" checked autocomplete="off" />
+            <span>Objectives</span>
+          </label>
+          <label class="toolbar-check" title="Show each objective's distance to its nearest capturable enemy pixel">
+            <input type="checkbox" id="show-perimeters" checked autocomplete="off" />
+            <span>Objective perimeters</span>
+          </label>
+          <div class="toolbar-group region-tools">
+            <button class="btn" id="region-select" type="button" aria-pressed="false" title="Draw a region on the map">Select region</button>
+          </div>
         </div>
 
         <div class="viewport" id="viewport">
           <div class="stage" id="stage">
             <canvas id="map-canvas" width="1920" height="1080"></canvas>
+            <canvas id="battle-overlay" width="1920" height="1080" aria-hidden="true"></canvas>
           </div>
           <svg class="city-overlay" id="city-overlay" aria-hidden="true">
             <defs>
@@ -97,6 +105,19 @@
             </defs>
           </svg>
           <svg class="objective-overlay" id="objective-overlay" aria-hidden="true"></svg>
+          <svg class="region-overlay" id="region-overlay" aria-hidden="true"></svg>
+          <section class="map-intel" id="region-intel" aria-labelledby="region-title">
+            <div class="map-intel-head">
+              <h2 id="region-title">Region Intel</h2>
+              <span class="region-status" id="region-status">No selection</span>
+            </div>
+            <div class="region-stats" id="region-stats" hidden aria-live="polite">
+              <div class="region-stat"><span>Red land</span><strong class="cell-red" id="region-red-pixels">—</strong></div>
+              <div class="region-stat"><span>Blue land</span><strong class="cell-blue" id="region-blue-pixels">—</strong></div>
+              <div class="region-stat"><span>Red cities</span><strong class="cell-red" id="region-red-cities">—</strong></div>
+              <div class="region-stat"><span>Blue cities</span><strong class="cell-blue" id="region-blue-cities">—</strong></div>
+            </div>
+          </section>
           <div class="map-loading" id="map-loading" hidden>
             <span class="loading-dots"><i></i><i></i><i></i></span>
             <span>Decoding battlefield…</span>
@@ -134,6 +155,8 @@
             <li><span class="swatch" style="background:#3f6ce0"></span> Blue Republic territory</li>
             <li><span class="swatch swatch-star" style="color:#d94141">★</span> Red Empire objective</li>
             <li><span class="swatch swatch-star" style="color:#3f6ce0">★</span> Blue Republic objective</li>
+            <li><span class="swatch swatch-fighting swatch-fighting-red"></span> Red objective attack front</li>
+            <li><span class="swatch swatch-fighting swatch-fighting-blue"></span> Blue objective attack front</li>
             <li><span class="swatch swatch-terrain"></span> Terrain</li>
           </ul>
           <p class="hint">Scroll to zoom, drag to pan. Use the arrow keys to step through time and the space key to play.</p>
@@ -153,13 +176,12 @@
               <tr>
                 <th class="num">#</th>
                 <th>Captured</th>
-                <th class="num">Red %</th>
-                <th class="num">Blue %</th>
-                <th class="num" title="Lead in percentage points">Lead (pp)</th>
-                <th class="num" title="Change in territory share vs the previous snapshot, in percentage points">Δ Share (pp)</th>
-                <th class="num" title="Net land that changed hands vs the previous snapshot">Δ Land</th>
-                <th class="num" title="Cities controlled by each faction">Cities (R / B)</th>
-                <th class="num" title="Net city-control change versus the previous snapshot">Δ Cities</th>
+                <th class="num" title="Land share controlled by Red and Blue"><strong>Land Control (R / B)</strong></th>
+                <th class="num" title="Land lead in percentage points">Lead</th>
+                <th class="num" title="Net land that changed hands vs the previous snapshot">Progress</th>
+                <th class="num" style="font-weight: bold;" title="Cities controlled by each faction"><strong>Cities (R / B)</strong></th>
+                <th class="num" title="Lead in cities controlled">Lead</th>
+                <th class="num" title="Net city-control change versus the previous snapshot">Progress</th>
               </tr>
             </thead>
             <tbody id="snap-tbody"></tbody>
@@ -171,9 +193,9 @@
       <section class="card panel chart-card">
         <div class="panel-head">
           <h2>📈 Momentum</h2>
-          <span class="chart-status" id="chart-status"></span>
+          <span class="chart-status" id="chart-status" aria-live="polite"></span>
         </div>
-        <p class="panel-sub">Share of claimed territory over time — hover to inspect, click to jump the map to that moment.</p>
+        <p class="panel-sub">Solid lines show land; dashed lines show cities. Press and drag between two snapshots to compare them; release to clear the selection.</p>
         <div class="chart-wrap" id="chart-wrap">
           <svg id="chart-svg" role="img" aria-label="Territory share over time"></svg>
           <div class="chart-tooltip" id="chart-tooltip" hidden></div>

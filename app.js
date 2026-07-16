@@ -27,8 +27,10 @@ const els = {
   viewport: $("viewport"),
   stage: $("stage"),
   canvas: $("map-canvas"),
+  battleCanvas: $("battle-overlay"),
   cityOverlay: $("city-overlay"),
   objectiveOverlay: $("objective-overlay"),
+  regionOverlay: $("region-overlay"),
   loading: $("map-loading"),
   zoomIn: $("zoom-in"),
   zoomOut: $("zoom-out"),
@@ -36,6 +38,16 @@ const els = {
   overlayAlpha: $("overlay-alpha"),
   showCities: $("show-cities"),
   showObjectives: $("show-objectives"),
+  showPerimeters: $("show-perimeters"),
+  regionSelect: $("region-select"),
+  regionIntel: $("region-intel"),
+  regionStatus: $("region-status"),
+  regionStats: $("region-stats"),
+  regionRedPixels: $("region-red-pixels"),
+  regionBluePixels: $("region-blue-pixels"),
+  regionRedCities: $("region-red-cities"),
+  regionBlueCities: $("region-blue-cities"),
+  regionObjectives: $("region-objectives"),
   playBtn: $("play-btn"),
   playSpeed: $("play-speed"),
   slider: $("timeline-slider"),
@@ -68,6 +80,10 @@ const state = {
   overlayAlpha: 0.55,
   health: null,
   view: { scale: 1, tx: 0, ty: 0, fit: 1 },
+  region: { selecting: false, pointerId: null, start: null, bounds: null },
+  renderedFronts: null,
+  frontImage: null,
+  frontGlowScale: null,
 };
 
 /* ---------- Fetch and decode helpers ---------- */
@@ -217,6 +233,45 @@ function buildLegacy(row, raw) {
   return { rgba, red, blue };
 }
 
+/* A front pixel is an enemy-owned conversion target touching the attacker's
+ * territory. Encoded values store (pixel index * 2 + attacking faction), where
+ * 1 is Red and 0 is Blue. Checking each edge once marks both sides of a front. */
+function buildBattlefronts(row, rgba) {
+  const total = row.width * row.height;
+  const marked = new Uint8Array(total);
+
+  function markOpposingPair(pixel, neighbor) {
+    const offset = pixel * 4;
+    const neighborOffset = neighbor * 4;
+    if (rgba[offset + 3] === 0 || rgba[neighborOffset + 3] === 0) return;
+    if (rgba[offset] === rgba[neighborOffset]) return;
+    marked[pixel] = 1;
+    marked[neighbor] = 1;
+  }
+
+  for (let y = 0; y < row.height; y += 1) {
+    const rowStart = y * row.width;
+    for (let x = 0; x < row.width; x += 1) {
+      const pixel = rowStart + x;
+      if (x + 1 < row.width) markOpposingPair(pixel, pixel + 1);
+      if (y + 1 < row.height) markOpposingPair(pixel, pixel + row.width);
+    }
+  }
+
+  let count = 0;
+  for (const value of marked) count += value;
+  const fronts = new Uint32Array(count);
+  let frontIndex = 0;
+  for (let pixel = 0; pixel < total; pixel += 1) {
+    if (!marked[pixel]) continue;
+    const isRedTarget = rgba[pixel * 4] === RED_RGB[0];
+    const attacker = isRedTarget ? 0 : 1;
+    fronts[frontIndex] = pixel * 2 + attacker;
+    frontIndex += 1;
+  }
+  return fronts;
+}
+
 /* Decoded overlays are cached as promises keyed by immutable mapHash,
  * so concurrent prefetch and scrub requests share one download. */
 function getDecoded(row) {
@@ -240,9 +295,10 @@ function getDecoded(row) {
     canvas.width = row.width;
     canvas.height = row.height;
     canvas.getContext("2d").putImageData(new ImageData(built.rgba, row.width, row.height), 0, 0);
+    const fronts = buildBattlefronts(row, built.rgba);
     const cityOwners = sampleCityOwners(row, built.rgba);
     setStat(row.mapHash, built.red, built.blue, countCityOwners(cityOwners));
-    return { canvas, red: built.red, blue: built.blue, cityOwners };
+    return { canvas, red: built.red, blue: built.blue, cityOwners, fronts };
   })();
   promise.catch(() => state.cache.delete(row.mapHash));
   state.cache.set(row.mapHash, promise);
@@ -263,8 +319,10 @@ function drawMap() {
   ctx.globalAlpha = state.overlayAlpha;
   ctx.drawImage(entry.canvas, 0, 0);
   ctx.globalAlpha = 1;
+  drawFighting(entry.fronts, row.width, row.height);
   drawCities(entry.cityOwners);
-  drawObjectives(row.objectives);
+  drawObjectives(row.objectives, entry.fronts, row.width, row.height);
+  renderRegionOutline();
 }
 
 function buildCityMarkers() {
@@ -298,18 +356,127 @@ function drawCities(owners) {
   });
 }
 
-function drawObjectives(objectives) {
-  els.objectiveOverlay.replaceChildren();
-  if (!els.showObjectives.checked || !Array.isArray(objectives)) return;
+function objectivePerimeters(objectives, fronts, width, height) {
+  return objectives.map(({ objective, index }) => {
+    const perimeter = {
+      index,
+      x: objective[1],
+      y: objective[0],
+      faction: index % 2,
+      distanceSquared: Infinity,
+    };
+    const distances = [];
+    for (const encoded of fronts) {
+      if ((encoded & 1) !== perimeter.faction) continue;
+      const pixel = encoded >> 1;
+      const x = ((pixel % width) * MAP_W) / width;
+      const y = (Math.floor(pixel / width) * MAP_H) / height;
+      const dx = x - perimeter.x;
+      const dy = y - perimeter.y;
+      distances.push(dx * dx + dy * dy);
+    }
+    distances.sort((a, b) => a - b);
+    // Ignore the 50 closest pixels so isolated frontline specks do not collapse the perimeter.
+    // Very small fronts still use their farthest available pixel instead of hiding the circle.
+    perimeter.distanceSquared = distances[Math.min(50, distances.length - 1)] ?? Infinity;
+    return perimeter;
+  });
+}
+
+function createObjectivePerimeter(svgNamespace, index, faction) {
+  const group = document.createElementNS(svgNamespace, "g");
+  group.setAttribute("class", `objective-perimeter-group objective-perimeter-group-${faction}`);
+  group.dataset.objectiveIndex = String(index);
+  group.classList.add("is-snapping");
+  const layers = [["ring", 0]];
+  for (const [layer, radiusOffset] of layers) {
+    const circle = document.createElementNS(svgNamespace, "circle");
+    circle.setAttribute("class", `objective-perimeter objective-perimeter-${layer} objective-perimeter-${layer}-${faction}`);
+    circle.dataset.radiusOffset = String(radiusOffset);
+    group.append(circle);
+  }
+  return group;
+}
+
+function updateObjectivePerimeter(group, perimeter) {
+  const x = String(perimeter.x);
+  const y = String(perimeter.y);
+  const locationChanged = group.dataset.objectiveX !== x || group.dataset.objectiveY !== y;
+  if (locationChanged) group.classList.add("is-snapping");
+  group.dataset.objectiveX = x;
+  group.dataset.objectiveY = y;
+
+  const radius = Math.sqrt(perimeter.distanceSquared);
+  for (const circle of group.querySelectorAll("circle")) {
+    circle.setAttribute("cx", x);
+    circle.setAttribute("cy", y);
+    const radiusOffset = Number(circle.dataset.radiusOffset || 0);
+    circle.style.setProperty("r", `${Math.max(0, radius + radiusOffset)}px`);
+  }
+
+  if (locationChanged) {
+    // Commit the new center and radius together before restoring eased radius updates.
+    group.getBoundingClientRect();
+    group.classList.remove("is-snapping");
+  }
+}
+
+function clearObjectiveGraphics() {
+  for (const element of els.objectiveOverlay.querySelectorAll(".objective-marker, .objective-perimeter-group")) {
+    element.remove();
+  }
+}
+
+function drawObjectives(objectives, fronts, width, height) {
+  for (const marker of els.objectiveOverlay.querySelectorAll(".objective-marker")) marker.remove();
+  if (!Array.isArray(objectives)) {
+    clearObjectiveGraphics();
+    return;
+  }
+  const showMarkers = els.showObjectives.checked;
+  const showPerimeters = els.showPerimeters.checked;
+  if (!showMarkers && !showPerimeters) {
+    clearObjectiveGraphics();
+    return;
+  }
 
   // Objective pairs are [y, x]: x values exceed the map height of 1080.
   // The first objective is the Blue Republic's, the second the Red Empire's.
   const colors = ["#3f6ce0", "#d94141"];
   const svgNamespace = "http://www.w3.org/2000/svg";
-  objectives.forEach((objective, index) => {
-    if (!Array.isArray(objective)
-        || !Number.isFinite(objective[0])
-        || !Number.isFinite(objective[1])) return;
+  const validObjectives = objectives
+    .map((objective, index) => ({ objective, index }))
+    .filter(({ objective }) => Array.isArray(objective)
+      && Number.isFinite(objective[0])
+      && Number.isFinite(objective[1]));
+
+  if (showPerimeters) {
+    const perimeters = objectivePerimeters(validObjectives, fronts, width, height);
+    const existing = new Map(
+      [...els.objectiveOverlay.querySelectorAll(".objective-perimeter-group")]
+        .map((group) => [Number(group.dataset.objectiveIndex), group]),
+    );
+    const active = new Set();
+    perimeters.forEach((perimeter) => {
+      if (!Number.isFinite(perimeter.distanceSquared)) return;
+      const faction = perimeter.faction === 1 ? "red" : "blue";
+      let group = existing.get(perimeter.index);
+      if (!group) {
+        group = createObjectivePerimeter(svgNamespace, perimeter.index, faction);
+        els.objectiveOverlay.append(group);
+      }
+      active.add(perimeter.index);
+      updateObjectivePerimeter(group, perimeter);
+    });
+    for (const [index, group] of existing) {
+      if (!active.has(index)) group.remove();
+    }
+  } else {
+    for (const group of els.objectiveOverlay.querySelectorAll(".objective-perimeter-group")) group.remove();
+  }
+
+  if (!showMarkers) return;
+  validObjectives.forEach(({ objective, index }) => {
     const star = document.createElementNS(svgNamespace, "path");
     star.setAttribute("class", "objective-marker");
     star.setAttribute("d", starPath(objective[1], objective[0], 14));
@@ -335,6 +502,7 @@ function updateOverlayViews() {
   const viewBox = `${-tx / scale} ${-ty / scale} ${rect.width / scale} ${rect.height / scale}`;
   els.cityOverlay.setAttribute("viewBox", viewBox);
   els.objectiveOverlay.setAttribute("viewBox", viewBox);
+  els.regionOverlay.setAttribute("viewBox", viewBox);
 }
 
 function formatPct(value) {
@@ -351,6 +519,148 @@ function updateStats(entry) {
   els.blueCount.textContent = `${entry.blue.toLocaleString()} px`;
   els.barRed.style.width = `${redShare * 100}%`;
   els.barBlue.style.width = `${(1 - redShare) * 100}%`;
+}
+
+function drawFighting(fronts, width, height) {
+  const canvas = els.battleCanvas;
+  const ctx = canvas.getContext("2d");
+  const visible = els.showObjectives.checked;
+  canvas.classList.toggle("is-hidden", !visible);
+  if (!visible) return;
+
+  if (!state.frontImage || state.frontImage.width !== width || state.frontImage.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+    state.frontImage = ctx.createImageData(width, height);
+    state.renderedFronts = null;
+  }
+
+  const pixels = state.frontImage.data;
+  if (state.renderedFronts) {
+    for (const encoded of state.renderedFronts) {
+      pixels[(encoded >> 1) * 4 + 3] = 0;
+    }
+  }
+
+  for (const encoded of fronts) {
+    const offset = (encoded >> 1) * 4;
+    const redAttacker = (encoded & 1) === 1;
+    pixels[offset] = redAttacker ? 255 : 38;
+    pixels[offset + 1] = redAttacker ? 48 : 154;
+    pixels[offset + 2] = redAttacker ? 30 : 255;
+    pixels[offset + 3] = 255;
+  }
+  ctx.putImageData(state.frontImage, 0, 0);
+  state.renderedFronts = fronts;
+}
+
+function normalizedRegion(start, end) {
+  return {
+    left: Math.min(start.x, end.x),
+    top: Math.min(start.y, end.y),
+    right: Math.max(start.x, end.x),
+    bottom: Math.max(start.y, end.y),
+  };
+}
+
+function regionPoint(event) {
+  const rect = els.viewport.getBoundingClientRect();
+  const { scale, tx, ty } = state.view;
+  return {
+    x: Math.max(0, Math.min(MAP_W, (event.clientX - rect.left - tx) / scale)),
+    y: Math.max(0, Math.min(MAP_H, (event.clientY - rect.top - ty) / scale)),
+  };
+}
+
+function renderRegionOutline() {
+  const { bounds } = state.region;
+  els.regionOverlay.replaceChildren();
+  if (!bounds) return;
+  const outline = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  outline.setAttribute("class", "region-outline");
+  outline.setAttribute("x", bounds.left);
+  outline.setAttribute("y", bounds.top);
+  outline.setAttribute("width", bounds.right - bounds.left);
+  outline.setAttribute("height", bounds.bottom - bounds.top);
+  els.regionOverlay.append(outline);
+}
+
+function updateRegionStats() {
+  const { bounds } = state.region;
+  const current = state.current;
+  els.regionIntel.classList.toggle("has-selection", Boolean(bounds));
+  els.regionIntel.classList.toggle("is-selecting", state.region.selecting && !bounds);
+  els.regionStats.hidden = !bounds;
+  if (!bounds) {
+    els.regionStatus.textContent = state.region.selecting ? "Drag on map" : "No selection";
+    return;
+  }
+  if (!current) return;
+
+  const canvasLeft = Math.floor((bounds.left * current.entry.canvas.width) / MAP_W);
+  const canvasTop = Math.floor((bounds.top * current.entry.canvas.height) / MAP_H);
+  const canvasRight = Math.ceil((bounds.right * current.entry.canvas.width) / MAP_W);
+  const canvasBottom = Math.ceil((bounds.bottom * current.entry.canvas.height) / MAP_H);
+  const pixels = current.entry.canvas.getContext("2d")
+    .getImageData(canvasLeft, canvasTop, canvasRight - canvasLeft, canvasBottom - canvasTop).data;
+  let red = 0;
+  let blue = 0;
+  for (let i = 0; i < pixels.length; i += 4) {
+    if (pixels[i + 3] === 0) continue;
+    if (pixels[i] === RED_RGB[0]) red += 1;
+    else blue += 1;
+  }
+
+  let cityRed = 0;
+  let cityBlue = 0;
+  const { worldSize, cities } = state.cityData;
+  cities.forEach(([x, y], index) => {
+    const mapX = (x * MAP_W) / worldSize.width;
+    const mapY = (y * MAP_H) / worldSize.height;
+    if (mapX < bounds.left || mapX > bounds.right || mapY < bounds.top || mapY > bounds.bottom) return;
+    if (current.entry.cityOwners[index] === 1) cityRed += 1;
+    else if (current.entry.cityOwners[index] === 0) cityBlue += 1;
+  });
+
+  let objectiveRed = 0;
+  let objectiveBlue = 0;
+  if (Array.isArray(current.row.objectives)) {
+    current.row.objectives.forEach((objective, index) => {
+      if (!Array.isArray(objective)) return;
+      const [y, x] = objective;
+      if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) return;
+      if (index % 2 === 0) objectiveBlue += 1;
+      else objectiveRed += 1;
+    });
+  }
+
+  const total = red + blue;
+  const redShare = total > 0 ? (red / total) * 100 : null;
+  els.regionStatus.textContent = `${Math.round(bounds.right - bounds.left)} × ${Math.round(bounds.bottom - bounds.top)} px`;
+  els.regionRedPixels.textContent = redShare === null ? "0 px" : `${red.toLocaleString()} px (${redShare.toFixed(1)}%)`;
+  els.regionBluePixels.textContent = redShare === null ? "0 px" : `${blue.toLocaleString()} px (${(100 - redShare).toFixed(1)}%)`;
+  els.regionRedCities.textContent = cityRed.toLocaleString();
+  els.regionBlueCities.textContent = cityBlue.toLocaleString();
+  els.regionObjectives.textContent = `R ${objectiveRed} · B ${objectiveBlue}`;
+}
+
+function setRegionSelection(selecting) {
+  state.region.selecting = selecting;
+  els.regionSelect.classList.toggle("is-active", selecting);
+  els.regionSelect.setAttribute("aria-pressed", String(selecting));
+  els.regionSelect.textContent = selecting ? "Clear" : "Select region";
+  els.regionSelect.title = selecting ? "Clear the selected region" : "Draw a region on the map";
+  els.viewport.classList.toggle("selecting-region", selecting);
+  els.regionIntel.classList.toggle("is-selecting", selecting && !state.region.bounds);
+  if (!state.region.bounds) els.regionStatus.textContent = selecting ? "Drag on map" : "No selection";
+}
+
+function clearRegion() {
+  state.region.bounds = null;
+  state.region.start = null;
+  state.region.pointerId = null;
+  renderRegionOutline();
+  updateRegionStats();
 }
 
 const timeFormat = new Intl.DateTimeFormat(undefined, {
@@ -380,6 +690,7 @@ async function setIndex(rawIndex) {
     state.current = { row, entry };
     drawMap();
     updateStats(entry);
+    updateRegionStats();
     clearError();
   } catch (error) {
     if (token === state.renderToken) showError(`Could not load snapshot #${row.id}: ${error.message}`);
@@ -501,11 +812,17 @@ const statsQueued = new Set();
 let statsActive = 0;
 let statsPersistTimer = null;
 let analyticsTimer = 0;
-let chartHit = null; // { points: [{x, i, t, share}], hoverLine }
+let chartHit = null; // chart points and transient hover/drag SVG elements
+let chartDrag = null; // { pointerId, start, current }
 
 function shareOf(stats) {
   const total = stats.red + stats.blue;
   return total > 0 ? (stats.red / total) * 100 : null;
+}
+
+function cityShareOf(stats) {
+  const total = stats.cityRed + stats.cityBlue;
+  return total > 0 ? (stats.cityRed / total) * 100 : null;
 }
 
 function loadPersistedStats() {
@@ -638,11 +955,37 @@ function svgEl(name, attrs) {
   return el;
 }
 
+function formatChartSpan(seconds) {
+  const hours = seconds / 3600;
+  if (hours >= 48 && Math.abs(hours / 24 - Math.round(hours / 24)) < 0.08) {
+    return `${Math.round(hours / 24)} d`;
+  }
+  if (hours >= 1) return `${Math.round(hours)} h`;
+  return `${Math.max(1, Math.round(seconds / 60))} min`;
+}
+
+function factionSpan(text, faction, className) {
+  const span = document.createElement("span");
+  span.className = `${className} ${className}-${faction}`;
+  span.textContent = text;
+  return span;
+}
+
+function chartTrendBaseline(points) {
+  const latest = points[points.length - 1];
+  const target = latest.t - 24 * 3600;
+  let baseline = points[0];
+  for (const point of points) {
+    if (Math.abs(point.t - target) < Math.abs(baseline.t - target)) baseline = point;
+  }
+  return baseline;
+}
+
 function renderChartStatus(points) {
   const el = els.chartStatus;
+  el.replaceChildren();
   const total = state.rows.length;
   if (total === 0 || points.length === 0) {
-    el.textContent = "";
     el.className = "chart-status";
     return;
   }
@@ -653,27 +996,28 @@ function renderChartStatus(points) {
   }
   const latest = points[points.length - 1];
   const margin = latest.share - (100 - latest.share);
-  let text;
+  el.className = "chart-status";
   if (Math.abs(margin) < 0.005) {
-    text = "Dead heat";
+    el.append("Dead heat");
   } else {
-    text = `${margin > 0 ? "Red Empire" : "Blue Republic"} leads by ${Math.abs(margin).toFixed(2)} pp`;
+    const faction = margin > 0 ? "red" : "blue";
+    const name = faction === "red" ? "Red Empire" : "Blue Republic";
+    el.append(factionSpan(`${name} leads by ${Math.abs(margin).toFixed(2)} pp`, faction, "chart-leader"));
   }
-  // Trend against the point closest to 24 h ago (if history reaches back far enough).
-  const target = latest.t - 24 * 3600;
-  let baseline = points[0];
-  for (const p of points) {
-    if (Math.abs(p.t - target) < Math.abs(baseline.t - target)) baseline = p;
-  }
-  if (latest.t - baseline.t >= 3 * 3600) {
+
+  const baseline = chartTrendBaseline(points);
+  if (latest.t > baseline.t) {
     const change = latest.share - baseline.share;
+    const span = formatChartSpan(latest.t - baseline.t);
+    el.append(" · ");
     if (Math.abs(change) >= 0.005) {
-      const hours = Math.round((latest.t - baseline.t) / 3600);
-      text += ` · ${change > 0 ? "Red" : "Blue"} +${Math.abs(change).toFixed(2)} pp in ${hours} h`;
+      const faction = change > 0 ? "red" : "blue";
+      const name = faction === "red" ? "Red" : "Blue";
+      el.append(factionSpan(`${name} +${Math.abs(change).toFixed(2)} pp in ${span}`, faction, "chart-change"));
+    } else {
+      el.append(`No change in ${span}`);
     }
   }
-  el.textContent = text;
-  el.className = `chart-status ${margin >= 0 ? "lead-red" : "lead-blue"}`;
 }
 
 function renderChart() {
@@ -690,7 +1034,18 @@ function renderChart() {
   for (let i = 0; i < rows.length; i += 1) {
     const stats = state.stats.get(rows[i].mapHash);
     const share = stats ? shareOf(stats) : null;
-    if (share !== null) points.push({ i, t: rows[i].capturedAt, share });
+    if (share !== null) {
+      points.push({
+        i,
+        t: rows[i].capturedAt,
+        share,
+        red: stats.red,
+        blue: stats.blue,
+        cityShare: cityShareOf(stats),
+        cityRed: stats.cityRed,
+        cityBlue: stats.cityBlue,
+      });
+    }
   }
   renderChartStatus(points);
   if (points.length < 2) {
@@ -700,11 +1055,11 @@ function renderChart() {
     return;
   }
 
-  const pad = { top: 18, right: 66, bottom: 26, left: 12 };
+  const pad = { top: 32, right: 66, bottom: 26, left: 12 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
-  const t0 = rows[0].capturedAt;
-  const t1 = rows[rows.length - 1].capturedAt;
+  const t0 = points[0].t;
+  const t1 = points[points.length - 1].t;
   const xOf = (t) => (t1 === t0 ? pad.left + plotW / 2 : pad.left + ((t - t0) / (t1 - t0)) * plotW);
 
   // Y domain covers both lines, always includes the 50% battle line.
@@ -713,6 +1068,10 @@ function renderChart() {
   for (const p of points) {
     lo = Math.min(lo, p.share, 100 - p.share);
     hi = Math.max(hi, p.share, 100 - p.share);
+    if (p.cityShare !== null) {
+      lo = Math.min(lo, p.cityShare, 100 - p.cityShare);
+      hi = Math.max(hi, p.cityShare, 100 - p.cityShare);
+    }
   }
   const padY = Math.max(0.3, (hi - lo) * 0.12);
   lo = Math.max(0, lo - padY);
@@ -721,11 +1080,21 @@ function renderChart() {
 
   let redLine = "";
   let blueLine = "";
+  let cityRedLine = "";
+  let cityBlueLine = "";
+  let citySegment = 0;
   for (let k = 0; k < points.length; k += 1) {
     const p = points[k];
     const x = xOf(p.t).toFixed(1);
     redLine += `${k === 0 ? "M" : "L"}${x},${yOf(p.share).toFixed(1)}`;
     blueLine += `${k === 0 ? "M" : "L"}${x},${yOf(100 - p.share).toFixed(1)}`;
+    if (p.cityShare === null) {
+      citySegment = 0;
+    } else {
+      cityRedLine += `${citySegment === 0 ? "M" : "L"}${x},${yOf(p.cityShare).toFixed(1)}`;
+      cityBlueLine += `${citySegment === 0 ? "M" : "L"}${x},${yOf(100 - p.cityShare).toFixed(1)}`;
+      citySegment += 1;
+    }
   }
   const bottom = (pad.top + plotH).toFixed(1);
   const firstX = xOf(points[0].t).toFixed(1);
@@ -759,6 +1128,14 @@ function renderChart() {
     svg.append(label);
   }
 
+  const landKey = svgEl("line", { x1: pad.left, x2: pad.left + 22, y1: 12, y2: 12, class: "chart-line chart-line-red" });
+  const landKeyLabel = svgEl("text", { x: pad.left + 28, y: 16, class: "chart-series-label" });
+  landKeyLabel.textContent = "Land";
+  const cityKey = svgEl("line", { x1: pad.left + 78, x2: pad.left + 100, y1: 12, y2: 12, class: "chart-line chart-line-red chart-line-city" });
+  const cityKeyLabel = svgEl("text", { x: pad.left + 106, y: 16, class: "chart-series-label" });
+  cityKeyLabel.textContent = "Cities";
+  svg.append(landKey, landKeyLabel, cityKey, cityKeyLabel);
+
   // Time axis.
   const spanSeconds = t1 - t0;
   const tickFormat = new Intl.DateTimeFormat(
@@ -778,21 +1155,30 @@ function renderChart() {
 
   // Marker for the snapshot currently shown on the map.
   const currentRow = rows[state.index];
-  if (currentRow) {
+  if (currentRow && currentRow.capturedAt >= t0 && currentRow.capturedAt <= t1) {
     const x = xOf(currentRow.capturedAt).toFixed(1);
     svg.append(svgEl("line", { x1: x, x2: x, y1: pad.top, y2: pad.top + plotH, class: "chart-marker" }));
     const currentPoint = points.find((p) => p.i === state.index);
     if (currentPoint) {
-      svg.append(
+      const markers = [
         svgEl("circle", { cx: x, cy: yOf(currentPoint.share).toFixed(1), r: 4, class: "chart-dot chart-dot-red" }),
         svgEl("circle", { cx: x, cy: yOf(100 - currentPoint.share).toFixed(1), r: 4, class: "chart-dot chart-dot-blue" }),
-      );
+      ];
+      if (currentPoint.cityShare !== null) {
+        markers.push(
+          svgEl("rect", { x: Number(x) - 3.5, y: yOf(currentPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-red" }),
+          svgEl("rect", { x: Number(x) - 3.5, y: yOf(100 - currentPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-blue" }),
+        );
+      }
+      svg.append(...markers);
     }
   }
 
   svg.append(
     svgEl("path", { d: redLine, class: "chart-line chart-line-red" }),
     svgEl("path", { d: blueLine, class: "chart-line chart-line-blue" }),
+    svgEl("path", { d: cityRedLine, class: "chart-line chart-line-red chart-line-city" }),
+    svgEl("path", { d: cityBlueLine, class: "chart-line chart-line-blue chart-line-city" }),
   );
 
   // Live endpoints: pulsing dots plus the current share, election-night style.
@@ -806,6 +1192,12 @@ function renderChart() {
     svgEl("circle", { cx: endX, cy: yRed, r: 3.5, class: "chart-dot chart-dot-red" }),
     svgEl("circle", { cx: endX, cy: yBlue, r: 3.5, class: "chart-dot chart-dot-blue" }),
   );
+  if (endPoint.cityShare !== null) {
+    svg.append(
+      svgEl("rect", { x: endX - 3.5, y: yOf(endPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-red chart-city-end" }),
+      svgEl("rect", { x: endX - 3.5, y: yOf(100 - endPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-blue chart-city-end" }),
+    );
+  }
   let labelYRed = yRed;
   let labelYBlue = yBlue;
   if (Math.abs(labelYRed - labelYBlue) < 16) {
@@ -820,10 +1212,27 @@ function renderChart() {
   blueLabel.textContent = `${(100 - endPoint.share).toFixed(2)}%`;
   svg.append(redLabel, blueLabel);
 
+  const dragRange = svgEl("rect", {
+    x: 0, y: pad.top, width: 0, height: plotH, class: "chart-drag-range",
+  });
+  const dragStartLine = svgEl("line", {
+    x1: 0, x2: 0, y1: pad.top, y2: pad.top + plotH, class: "chart-drag-marker",
+  });
+  const dragEndLine = svgEl("line", {
+    x1: 0, x2: 0, y1: pad.top, y2: pad.top + plotH, class: "chart-drag-marker",
+  });
   const hoverLine = svgEl("line", { x1: 0, x2: 0, y1: pad.top, y2: pad.top + plotH, class: "chart-hover-line" });
-  hoverLine.style.visibility = "hidden";
-  svg.append(hoverLine);
-  chartHit = { points: points.map((p) => ({ ...p, x: xOf(p.t) })), hoverLine };
+  for (const element of [dragRange, dragStartLine, dragEndLine, hoverLine]) {
+    element.style.visibility = "hidden";
+  }
+  svg.append(dragRange, dragStartLine, dragEndLine, hoverLine);
+  chartHit = {
+    points: points.map((p) => ({ ...p, x: xOf(p.t) })),
+    hoverLine,
+    dragRange,
+    dragStartLine,
+    dragEndLine,
+  };
 }
 
 function chartPointFromEvent(event) {
@@ -837,12 +1246,17 @@ function chartPointFromEvent(event) {
   return best;
 }
 
-function chartHover(event) {
-  const point = chartPointFromEvent(event);
-  if (!point) return;
-  chartHit.hoverLine.setAttribute("x1", point.x);
-  chartHit.hoverLine.setAttribute("x2", point.x);
-  chartHit.hoverLine.style.visibility = "visible";
+function positionChartTooltip(x) {
+  const tooltip = els.chartTooltip;
+  tooltip.hidden = false;
+  const wrapWidth = els.chartWrap.getBoundingClientRect().width;
+  const left = x + 14 + tooltip.offsetWidth > wrapWidth
+    ? x - 14 - tooltip.offsetWidth
+    : x + 14;
+  tooltip.style.left = `${Math.max(0, left)}px`;
+}
+
+function renderChartPointTooltip(point) {
   const tooltip = els.chartTooltip;
   tooltip.replaceChildren();
   const when = document.createElement("div");
@@ -850,29 +1264,120 @@ function chartHover(event) {
   when.textContent = timeFormat.format(new Date(point.t * 1000));
   const red = document.createElement("div");
   red.className = "tt-red";
-  red.textContent = `Red ${point.share.toFixed(3)}%`;
+  red.textContent = `Land · Red ${point.share.toFixed(3)}%`;
   const blue = document.createElement("div");
   blue.className = "tt-blue";
-  blue.textContent = `Blue ${(100 - point.share).toFixed(3)}%`;
+  blue.textContent = `Land · Blue ${(100 - point.share).toFixed(3)}%`;
   tooltip.append(when, red, blue);
-  tooltip.hidden = false;
-  const wrapWidth = els.chartWrap.getBoundingClientRect().width;
-  const left = point.x + 14 + tooltip.offsetWidth > wrapWidth
-    ? point.x - 14 - tooltip.offsetWidth
-    : point.x + 14;
-  tooltip.style.left = `${Math.max(0, left)}px`;
+  if (point.cityShare !== null) {
+    const cities = document.createElement("div");
+    cities.className = "tt-cities";
+    cities.textContent = `Cities · R ${point.cityRed} (${point.cityShare.toFixed(1)}%) / B ${point.cityBlue} (${(100 - point.cityShare).toFixed(1)}%)`;
+    tooltip.append(cities);
+  }
+  const hint = document.createElement("div");
+  hint.className = "tt-change";
+  hint.textContent = "Press and drag to compare snapshots";
+  tooltip.append(hint);
+  positionChartTooltip(point.x);
+}
+
+function changeLine(label, change, gained, unit) {
+  const line = document.createElement("div");
+  const faction = change > 0 ? "red" : change < 0 ? "blue" : null;
+  line.className = faction ? `tt-change-value tt-${faction}` : "tt-change-value";
+  if (!faction) {
+    line.textContent = `${label} · No change`;
+    return line;
+  }
+  const name = faction === "red" ? "Red" : "Blue";
+  const count = Math.abs(gained);
+  const countUnit = unit === "city" && count !== 1 ? "cities" : unit;
+  line.textContent = `${label} · ${name} +${Math.abs(change).toFixed(2)}% (+${count.toLocaleString()} ${countUnit})`;
+  return line;
+}
+
+function renderChartDragTooltip(first, second) {
+  const [start, end] = first.t <= second.t ? [first, second] : [second, first];
+  const tooltip = els.chartTooltip;
+  tooltip.replaceChildren();
+  const range = document.createElement("div");
+  range.className = "tt-time tt-range-time";
+  range.textContent = `${timeFormat.format(new Date(start.t * 1000))} → ${timeFormat.format(new Date(end.t * 1000))}`;
+  const duration = document.createElement("div");
+  duration.className = "tt-duration";
+  duration.textContent = start.i === end.i ? "Drag to another snapshot" : formatChartSpan(end.t - start.t);
+  const landChange = end.share - start.share;
+  const landGained = landChange >= 0 ? end.red - start.red : end.blue - start.blue;
+  tooltip.append(range, duration, changeLine("Land", landChange, landGained, "px"));
+  if (start.cityShare !== null && end.cityShare !== null) {
+    const cityChange = end.cityShare - start.cityShare;
+    const citiesGained = cityChange >= 0
+      ? end.cityRed - start.cityRed
+      : end.cityBlue - start.cityBlue;
+    tooltip.append(changeLine("Cities", cityChange, citiesGained, "city"));
+  }
+  positionChartTooltip(second.x);
+}
+
+function updateChartDrag(point) {
+  if (!chartDrag || !chartHit) return;
+  chartDrag.current = point;
+  const startX = chartDrag.start.x;
+  const endX = point.x;
+  chartHit.hoverLine.style.visibility = "hidden";
+  chartHit.dragRange.setAttribute("x", Math.min(startX, endX));
+  chartHit.dragRange.setAttribute("width", Math.abs(endX - startX));
+  chartHit.dragStartLine.setAttribute("x1", startX);
+  chartHit.dragStartLine.setAttribute("x2", startX);
+  chartHit.dragEndLine.setAttribute("x1", endX);
+  chartHit.dragEndLine.setAttribute("x2", endX);
+  for (const element of [chartHit.dragRange, chartHit.dragStartLine, chartHit.dragEndLine]) {
+    element.style.visibility = "visible";
+  }
+  renderChartDragTooltip(chartDrag.start, point);
+}
+
+function chartPointerDown(event) {
+  if (event.button !== 0 || !chartHit) return;
+  const point = chartPointFromEvent(event);
+  if (!point) return;
+  chartDrag = { pointerId: event.pointerId, start: point, current: point };
+  els.chartWrap.setPointerCapture(event.pointerId);
+  updateChartDrag(point);
+  event.preventDefault();
+}
+
+function chartPointerMove(event) {
+  const point = chartPointFromEvent(event);
+  if (!point) return;
+  if (chartDrag && event.pointerId === chartDrag.pointerId) {
+    updateChartDrag(point);
+    return;
+  }
+  chartHit.hoverLine.setAttribute("x1", point.x);
+  chartHit.hoverLine.setAttribute("x2", point.x);
+  chartHit.hoverLine.style.visibility = "visible";
+  renderChartPointTooltip(point);
+}
+
+function resetChartDrag(event) {
+  if (!chartDrag || (event && event.pointerId !== chartDrag.pointerId)) return;
+  const pointerId = chartDrag.pointerId;
+  chartDrag = null;
+  if (els.chartWrap.hasPointerCapture(pointerId)) els.chartWrap.releasePointerCapture(pointerId);
+  if (chartHit) {
+    for (const element of [chartHit.dragRange, chartHit.dragStartLine, chartHit.dragEndLine]) {
+      element.style.visibility = "hidden";
+    }
+  }
+  chartLeave();
 }
 
 function chartLeave() {
+  if (chartDrag) return;
   els.chartTooltip.hidden = true;
   if (chartHit) chartHit.hoverLine.style.visibility = "hidden";
-}
-
-function chartClick(event) {
-  const point = chartPointFromEvent(event);
-  if (!point) return;
-  setPlaying(false);
-  setIndex(point.i);
 }
 
 function addCell(tr, className, text) {
@@ -890,22 +1395,22 @@ function factionCell(tr, value, formatted) {
   }
 }
 
-function citiesCell(tr, stats) {
-  if (!stats || !Number.isFinite(stats.cityRed) || !Number.isFinite(stats.cityBlue)) {
+function splitFactionCell(tr, redValue, blueValue, format) {
+  if (!Number.isFinite(redValue) || !Number.isFinite(blueValue)) {
     addCell(tr, "num cell-flat", "…");
     return;
   }
   const td = document.createElement("td");
-  td.className = "num city-count-cell";
+  td.className = "num split-faction-cell";
   const red = document.createElement("span");
   red.className = "cell-red";
-  red.textContent = `R ${stats.cityRed}`;
+  red.textContent = format(redValue);
   const separator = document.createElement("span");
   separator.className = "cell-flat";
   separator.textContent = " / ";
   const blue = document.createElement("span");
   blue.className = "cell-blue";
-  blue.textContent = `B ${stats.cityBlue}`;
+  blue.textContent = format(blueValue);
   td.append(red, separator, blue);
   tr.append(td);
 }
@@ -926,8 +1431,12 @@ function renderTable() {
 
     addCell(tr, "num cell-flat", `#${row.id}`);
     addCell(tr, "", timeFormat.format(new Date(row.capturedAt * 1000)));
-    addCell(tr, "num cell-red", share === null ? "…" : `${share.toFixed(3)}%`);
-    addCell(tr, "num cell-blue", share === null ? "…" : `${(100 - share).toFixed(3)}%`);
+    splitFactionCell(
+      tr,
+      share,
+      share === null ? NaN : 100 - share,
+      (value) => `${value.toFixed(3)}%`,
+    );
 
     if (share === null) {
       addCell(tr, "num cell-flat", "…");
@@ -939,18 +1448,27 @@ function renderTable() {
     if (i === 0) {
       // Oldest loaded snapshot has nothing loaded to compare against.
       addCell(tr, "num cell-flat", "—");
-      addCell(tr, "num cell-flat", "—");
     } else if (share === null || prevShare === null) {
       addCell(tr, "num cell-flat", "…");
-      addCell(tr, "num cell-flat", "…");
     } else {
-      const deltaShare = share - prevShare;
-      factionCell(tr, Math.abs(deltaShare) < 0.0005 ? 0 : deltaShare, Math.abs(deltaShare).toFixed(3));
       const deltaPx = stats.red - prevStats.red;
       factionCell(tr, deltaPx, Math.abs(deltaPx).toLocaleString());
     }
 
-    citiesCell(tr, stats);
+    const hasCities = stats
+      && Number.isFinite(stats.cityRed)
+      && Number.isFinite(stats.cityBlue);
+    splitFactionCell(
+      tr,
+      hasCities ? stats.cityRed : NaN,
+      hasCities ? stats.cityBlue : NaN,
+      (value) => value.toLocaleString(),
+    );
+    if (!hasCities) {
+      addCell(tr, "num cell-flat", "…");
+    } else {
+      factionCell(tr, stats.cityRed - stats.cityBlue, Math.abs(stats.cityRed - stats.cityBlue).toLocaleString());
+    }
     if (i === 0) {
       addCell(tr, "num cell-flat", "—");
     } else if (!stats || !prevStats
@@ -968,9 +1486,11 @@ function renderTable() {
 
 function setupAnalytics() {
   loadPersistedStats();
-  els.chartWrap.addEventListener("pointermove", chartHover);
+  els.chartWrap.addEventListener("pointerdown", chartPointerDown);
+  els.chartWrap.addEventListener("pointermove", chartPointerMove);
+  els.chartWrap.addEventListener("pointerup", resetChartDrag);
+  els.chartWrap.addEventListener("pointercancel", resetChartDrag);
   els.chartWrap.addEventListener("pointerleave", chartLeave);
-  els.chartWrap.addEventListener("click", chartClick);
   els.snapTbody.addEventListener("click", (event) => {
     const tr = event.target.closest("tr[data-index]");
     if (!tr) return;
@@ -1000,6 +1520,16 @@ const MAP_H = 1080;
 function applyView() {
   const { scale, tx, ty } = state.view;
   els.stage.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+  // The battle canvas is transformed with the map, so compensate its filter
+  // radii to keep the fighting glow prominent at every zoom level.
+  if (state.frontGlowScale !== scale) {
+    const glowScale = 1 / Math.max(scale, 0.01);
+    els.battleCanvas.style.setProperty("--front-glow-core", `${4 * glowScale}px`);
+    els.battleCanvas.style.setProperty("--front-glow-near", `${9 * glowScale}px`);
+    els.battleCanvas.style.setProperty("--front-glow-mid", `${18 * glowScale}px`);
+    els.battleCanvas.style.setProperty("--front-glow-far", `${30 * glowScale}px`);
+    state.frontGlowScale = scale;
+  }
   updateOverlayViews();
 }
 
@@ -1056,6 +1586,14 @@ function setupViewport() {
   }, { passive: false });
 
   els.viewport.addEventListener("pointerdown", (event) => {
+    if (state.region.selecting && event.button === 0 && pointers.size === 0) {
+      els.viewport.setPointerCapture(event.pointerId);
+      state.region.pointerId = event.pointerId;
+      state.region.start = regionPoint(event);
+      state.region.bounds = normalizedRegion(state.region.start, state.region.start);
+      renderRegionOutline();
+      return;
+    }
     els.viewport.setPointerCapture(event.pointerId);
     pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (pointers.size === 2) {
@@ -1066,6 +1604,11 @@ function setupViewport() {
   });
 
   els.viewport.addEventListener("pointermove", (event) => {
+    if (state.region.pointerId === event.pointerId && state.region.start) {
+      state.region.bounds = normalizedRegion(state.region.start, regionPoint(event));
+      renderRegionOutline();
+      return;
+    }
     const previous = pointers.get(event.pointerId);
     if (!previous) return;
     const current = { x: event.clientX, y: event.clientY };
@@ -1086,6 +1629,14 @@ function setupViewport() {
   });
 
   const releasePointer = (event) => {
+    if (state.region.pointerId === event.pointerId) {
+      const bounds = state.region.bounds;
+      state.region.pointerId = null;
+      state.region.start = null;
+      if (bounds && (bounds.right - bounds.left < 4 || bounds.bottom - bounds.top < 4)) clearRegion();
+      else updateRegionStats();
+      return;
+    }
     pointers.delete(event.pointerId);
     pinchDistance = 0;
     if (pointers.size === 0) els.viewport.classList.remove("dragging");
@@ -1123,6 +1674,15 @@ function setupControls() {
   });
   els.showCities.addEventListener("change", drawMap);
   els.showObjectives.addEventListener("change", drawMap);
+  els.showPerimeters.addEventListener("change", drawMap);
+  els.regionSelect.addEventListener("click", () => {
+    if (state.region.selecting) {
+      clearRegion();
+      setRegionSelection(false);
+      return;
+    }
+    setRegionSelection(true);
+  });
 
   document.addEventListener("keydown", (event) => {
     const target = event.target;
@@ -1165,11 +1725,12 @@ async function init() {
   setupAnalytics();
   fitView();
   try {
-    const [terrain, mask, cityData, timeline, health] = await Promise.all([
+    const [terrain, mask, cityData, timeline, latest, health] = await Promise.all([
       loadTerrain(),
       (async () => inflate(await fetch(MASK_URL)))(),
       fetchJSON(CITY_DATA_URL),
       fetchJSON(`${API}/v1/timeline?limit=336`),
+      fetchJSON(`${API}/v1/snapshots/latest`),
       fetchJSON(`${API}/health`),
     ]);
     state.terrain = terrain;
@@ -1179,6 +1740,10 @@ async function init() {
     state.health = health;
     renderStatus();
     state.rows = timeline.rows.slice().reverse();
+    if (!state.rows.some((row) => row.id === latest.id)) {
+      state.rows.push(latest);
+      state.rows.sort((a, b) => a.capturedAt - b.capturedAt);
+    }
     state.nextBefore = timeline.nextBefore;
     els.loadOlder.hidden = !state.nextBefore;
     if (state.rows.length === 0) {
