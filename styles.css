@@ -31,9 +31,12 @@ body {
   line-height: 1.5;
 }
 
-body.auth-locked { overflow: hidden; }
+html[data-access-state="locked"] body { overflow: hidden; }
 
-body.auth-locked > :not(.access-gate) { display: none; }
+html[data-access-state="locked"] body > :not(.access-gate) { display: none; }
+
+html[data-access-state="restoring"] .access-gate,
+html[data-access-state="authenticated"] .access-gate { display: none; }
 
 .access-gate {
   min-height: 100vh;
