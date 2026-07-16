@@ -90,7 +90,9 @@ body.auth-locked > :not(.access-gate) { display: none; }
   border-radius: 9px;
   background: #fff;
   color: var(--ink);
-  font: 700 1rem var(--font-body);
+  font: 800 1.15rem "Courier New", "Lucida Console", ui-monospace, monospace;
+  letter-spacing: 2px;
+  text-align: center;
   outline: none;
 }
 
