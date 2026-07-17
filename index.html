@@ -196,7 +196,7 @@
       <section class="card panel table-card">
         <div class="panel-head">
           <h2>🧾 Snapshot Log</h2>
-          <span class="table-note">Newest first · Δ columns compare with the previous snapshot · click a row to view it</span>
+          <span class="table-note" id="snapshot-note">Newest first · Δ columns compare with the previous snapshot · click a row to view it</span>
         </div>
         <div class="table-scroll">
           <table class="snap-table">
@@ -220,10 +220,28 @@
     <section class="analytics" aria-label="Campaign analytics">
       <section class="card panel chart-card">
         <div class="panel-head">
-          <h2>📈 Momentum</h2>
-          <span class="chart-status" id="chart-status" aria-live="polite"></span>
+          <div class="chart-title-group">
+            <h2>📈 Momentum</h2>
+            <div class="chart-series-filter" role="group" aria-label="Visible chart series">
+              <span class="chart-series-filter-label">Show</span>
+              <button type="button" class="chart-series-option is-active" data-chart-series="land" aria-pressed="true">Land</button>
+              <button type="button" class="chart-series-option" data-chart-series="cities" aria-pressed="false">Cities</button>
+              <button type="button" class="chart-series-option" data-chart-series="both" aria-pressed="false">Both</button>
+            </div>
+          </div>
+          <div class="chart-head-tools">
+            <span class="chart-status" id="chart-status" aria-live="polite"></span>
+            <div class="chart-view-toggle" role="group" aria-label="Momentum chart view">
+              <button type="button" class="chart-view-option is-active" data-chart-mode="movement" aria-pressed="true">
+                <span class="chart-view-icon" aria-hidden="true">↗</span> Movement
+              </button>
+              <button type="button" class="chart-view-option" data-chart-mode="control" aria-pressed="false">
+                <span class="chart-view-icon" aria-hidden="true">◐</span> Control
+              </button>
+            </div>
+          </div>
         </div>
-        <p class="panel-sub">Solid lines show land; dashed lines show cities. Press and drag between two snapshots to compare them; release to clear the selection.</p>
+        <p class="panel-sub" id="chart-description">Movement zooms in on faction advantage across the available polls: up is Blue, down is Red. Solid is land/pixels; dotted is cities.</p>
         <div class="chart-wrap" id="chart-wrap">
           <svg id="chart-svg" role="img" aria-label="Territory share over time"></svg>
           <div class="chart-tooltip" id="chart-tooltip" hidden></div>

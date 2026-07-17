@@ -9,6 +9,7 @@ const CITY_DATA_URL = "assets/city-points.json";
 const RED_RGB = [217, 65, 65];
 const BLUE_RGB = [63, 108, 224];
 const CACHE_LIMIT = 30; // decoded overlay canvases kept in memory
+const OWNERSHIP_CACHE_LIMIT = 12; // decompressed snapshots shared by map and analytics workers
 const POLL_MS = 5 * 60 * 1000;
 const SESSION_KEY = "wod-nations-access-session";
 
@@ -66,9 +67,13 @@ const els = {
   loadOlder: $("load-older"),
   newsText: $("news-text"),
   chartStatus: $("chart-status"),
+  chartDescription: $("chart-description"),
+  chartModeButtons: document.querySelectorAll("[data-chart-mode]"),
+  chartSeriesButtons: document.querySelectorAll("[data-chart-series]"),
   chartWrap: $("chart-wrap"),
   chartSvg: $("chart-svg"),
   chartTooltip: $("chart-tooltip"),
+  snapshotNote: $("snapshot-note"),
   snapTbody: $("snap-tbody"),
 };
 
@@ -87,8 +92,11 @@ const state = {
   cityData: null,
   cityMarkers: [],
   cityOwnershipIndices: new Map(), // dimensions -> city index in compact ownership bitset
+  ownershipCache: new Map(), // mapHash -> Promise<Uint8Array>
   cache: new Map(), // mapHash -> Promise<{canvas, red, blue}>
   stats: new Map(), // mapHash -> pixel and city counts for the chart and log
+  chartMode: "movement",
+  chartSeries: "land",
   current: null, // {row, entry}
   overlayAlpha: 0.55,
   health: null,
@@ -107,6 +115,9 @@ const state = {
     islands: null,
     overlayImage: null,
     renderFrame: null,
+    scope: null,
+    stats: new Map(),
+    generation: 0,
   },
   renderedFronts: null,
   frontImage: null,
@@ -174,6 +185,24 @@ async function inflate(resp) {
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const stream = resp.body.pipeThrough(new DecompressionStream("deflate"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function getOwnershipBytes(row) {
+  const cached = state.ownershipCache.get(row.mapHash);
+  if (cached) {
+    state.ownershipCache.delete(row.mapHash);
+    state.ownershipCache.set(row.mapHash, cached);
+    return cached;
+  }
+  const promise = authenticatedFetch(new URL(row.mapUrl, API)).then(inflate);
+  promise.catch(() => {
+    if (state.ownershipCache.get(row.mapHash) === promise) state.ownershipCache.delete(row.mapHash);
+  });
+  state.ownershipCache.set(row.mapHash, promise);
+  while (state.ownershipCache.size > OWNERSHIP_CACHE_LIMIT) {
+    state.ownershipCache.delete(state.ownershipCache.keys().next().value);
+  }
+  return promise;
 }
 
 function bit(bytes, index) {
@@ -358,7 +387,7 @@ function getDecoded(row) {
     return cached;
   }
   const promise = (async () => {
-    const bytes = await inflate(await authenticatedFetch(new URL(row.mapUrl, API)));
+    const bytes = await getOwnershipBytes(row);
     let built;
     if (row.encoding === "playable-bitset-zlib-v1") {
       built = buildCompact(row, bytes, state.mask);
@@ -804,10 +833,94 @@ function setRegionSelection(active) {
   refreshRegionHover();
 }
 
+function regionContainsMapPoint(scope, x, y) {
+  if (scope.islandId) {
+    if (x < 0 || y < 0 || x >= MAP_W || y >= MAP_H) return false;
+    return state.region.labels[Math.floor(y) * MAP_W + Math.floor(x)] === scope.islandId;
+  }
+  const { bounds } = scope;
+  return x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
+}
+
+function buildRegionScope() {
+  const islandId = state.region.selectedId;
+  const island = state.region.islands?.[islandId];
+  const bounds = state.region.bounds;
+  if ((!island && !bounds) || !state.mask || !state.cityData) return null;
+
+  const pixelIndexes = [];
+  const ownershipIndexes = [];
+  let ownershipIndex = 0;
+  for (let pixel = 0; pixel < MAP_W * MAP_H; pixel += 1) {
+    if (!bit(state.mask, pixel)) continue;
+    const x = pixel % MAP_W;
+    const y = Math.floor(pixel / MAP_W);
+    const selected = island
+      ? state.region.labels[pixel] === islandId
+      : x + 0.5 >= bounds.left && x + 0.5 <= bounds.right
+        && y + 0.5 >= bounds.top && y + 0.5 <= bounds.bottom;
+    if (selected) {
+      pixelIndexes.push(pixel);
+      ownershipIndexes.push(ownershipIndex);
+    }
+    ownershipIndex += 1;
+  }
+
+  const { worldSize, cities } = state.cityData;
+  const cityIndexes = [];
+  cities.forEach(([x, y], index) => {
+    const mapX = (x * MAP_W) / worldSize.width;
+    const mapY = (y * MAP_H) / worldSize.height;
+    if (regionContainsMapPoint({ islandId, bounds }, mapX, mapY)) cityIndexes.push(index);
+  });
+
+  return {
+    generation: state.region.generation,
+    islandId,
+    bounds: bounds ? { ...bounds } : null,
+    mapBounds: island
+      ? { left: island.minX, top: island.minY, right: island.maxX + 1, bottom: island.maxY + 1 }
+      : { ...bounds },
+    pixelIndexes: Uint32Array.from(pixelIndexes),
+    ownershipIndexes: Uint32Array.from(ownershipIndexes),
+    cityIndexes: Uint32Array.from(cityIndexes),
+  };
+}
+
+function updateAnalyticsScopeCopy() {
+  const regional = Boolean(state.region.scope);
+  const baseNote = "Newest first · Δ columns compare with the previous snapshot · click a row to view it";
+  els.snapshotNote.textContent = regional ? `Selected region only · ${baseNote}` : baseNote;
+  const description = state.chartMode === "movement"
+    ? "Movement zooms in on faction advantage across the available polls: up is Blue, down is Red. Solid is land/pixels; dotted is cities."
+    : "Control shows Red and Blue shares: solid lines are land, dashed lines are cities. Press and drag to compare.";
+  els.chartDescription.textContent = regional ? `Selected region only. ${description}` : description;
+}
+
+function commitRegionAnalytics() {
+  state.region.generation += 1;
+  state.region.scope = buildRegionScope();
+  if (state.region.scope) state.region.scope.generation = state.region.generation;
+  state.region.stats.clear();
+  restartRegionStats(state.region.scope);
+  updateAnalyticsScopeCopy();
+  scheduleAnalytics();
+}
+
+function clearRegionAnalytics() {
+  state.region.generation += 1;
+  state.region.scope = null;
+  state.region.stats.clear();
+  restartRegionStats(null);
+  updateAnalyticsScopeCopy();
+  scheduleAnalytics();
+}
+
 function selectIsland(islandId) {
   if (!state.region.islands?.[islandId]) return;
   state.region.selectedId = islandId;
   state.region.bounds = null;
+  commitRegionAnalytics();
   renderRegionOutline();
   updateRegionStats();
 }
@@ -844,10 +957,14 @@ function updateRegionStats() {
   let red = 0;
   let blue = 0;
   for (let y = 0; y < selectionHeight; y += 1) {
-    const mapY = Math.min(MAP_H - 1, Math.floor(((canvasTop + y + 0.5) * MAP_H) / height));
+    const mapPointY = ((canvasTop + y + 0.5) * MAP_H) / height;
+    const mapY = Math.min(MAP_H - 1, Math.floor(mapPointY));
     for (let x = 0; x < selectionWidth; x += 1) {
-      const mapX = Math.min(MAP_W - 1, Math.floor(((canvasLeft + x + 0.5) * MAP_W) / width));
+      const mapPointX = ((canvasLeft + x + 0.5) * MAP_W) / width;
+      const mapX = Math.min(MAP_W - 1, Math.floor(mapPointX));
       if (island && state.region.labels[mapY * MAP_W + mapX] !== islandId) continue;
+      if (bounds && (mapPointX < bounds.left || mapPointX > bounds.right
+          || mapPointY < bounds.top || mapPointY > bounds.bottom)) continue;
       const offset = (y * selectionWidth + x) * 4;
       if (pixels[offset + 3] === 0) continue;
       if (pixels[offset] === RED_RGB[0]) red += 1;
@@ -894,6 +1011,14 @@ function updateRegionStats() {
   els.regionRedCities.textContent = cityRed.toLocaleString();
   els.regionBlueCities.textContent = cityBlue.toLocaleString();
   els.regionObjectives.textContent = `R ${objectiveRed} · B ${objectiveBlue}`;
+  if (state.region.scope) {
+    setRegionStat(current.row.mapHash, {
+      red,
+      blue,
+      cityRed,
+      cityBlue,
+    }, state.region.scope.generation);
+  }
 }
 
 function clearRegion() {
@@ -902,6 +1027,7 @@ function clearRegion() {
   state.region.pointerId = null;
   state.region.start = null;
   state.region.dragging = false;
+  clearRegionAnalytics();
   renderRegionOutline();
   updateRegionStats();
 }
@@ -1028,6 +1154,7 @@ async function loadOlder() {
     updatePanels(state.rows[state.index]);
     els.loadOlder.hidden = !state.nextBefore;
     queueStats(older);
+    queueRegionStats(older);
     scheduleAnalytics();
   } catch (error) {
     showError(`Could not load older snapshots: ${error.message}`);
@@ -1061,6 +1188,7 @@ async function refreshLive() {
       state.rows.push(latest);
       els.slider.max = String(state.rows.length - 1);
       queueStats([latest]);
+      queueRegionStats([latest]);
       scheduleAnalytics();
       if (wasAtEnd && !state.playing) setIndex(state.rows.length - 1);
       else updatePanels(state.rows[state.index]);
@@ -1086,6 +1214,9 @@ for (let i = 1; i < 256; i += 1) POPCOUNT[i] = POPCOUNT[i >> 1] + (i & 1);
 const statsQueue = [];
 const statsQueued = new Set();
 let statsActive = 0;
+const regionStatsQueue = [];
+const regionStatsQueued = new Set();
+let regionStatsActive = 0;
 let statsPersistTimer = null;
 let analyticsTimer = 0;
 let chartHit = null; // chart points and transient hover/drag SVG elements
@@ -1099,6 +1230,12 @@ function shareOf(stats) {
 function cityShareOf(stats) {
   const total = stats.cityRed + stats.cityBlue;
   return total > 0 ? (stats.cityRed / total) * 100 : null;
+}
+
+function analyticsStatsFor(row) {
+  return state.region.scope
+    ? state.region.stats.get(row.mapHash)
+    : state.stats.get(row.mapHash);
 }
 
 function loadPersistedStats() {
@@ -1166,6 +1303,173 @@ function countLegacy(bytes) {
   return { red, blue };
 }
 
+function countSelectedCities(owners, scope) {
+  let cityRed = 0;
+  let cityBlue = 0;
+  for (const cityIndex of scope.cityIndexes) {
+    if (owners[cityIndex] === 1) cityRed += 1;
+    else if (owners[cityIndex] === 0) cityBlue += 1;
+  }
+  return { cityRed, cityBlue };
+}
+
+function countRegionEntry(row, entry, scope) {
+  const { width, height } = entry.canvas;
+  const canvasLeft = Math.max(0, Math.floor(scope.mapBounds.left * width / MAP_W));
+  const canvasTop = Math.max(0, Math.floor(scope.mapBounds.top * height / MAP_H));
+  const canvasRight = Math.min(width, Math.ceil(scope.mapBounds.right * width / MAP_W));
+  const canvasBottom = Math.min(height, Math.ceil(scope.mapBounds.bottom * height / MAP_H));
+  const selectionWidth = canvasRight - canvasLeft;
+  const selectionHeight = canvasBottom - canvasTop;
+  let red = 0;
+  let blue = 0;
+  if (selectionWidth > 0 && selectionHeight > 0) {
+    const rgba = entry.canvas.getContext("2d")
+      .getImageData(canvasLeft, canvasTop, selectionWidth, selectionHeight).data;
+    for (let localY = 0; localY < selectionHeight; localY += 1) {
+      for (let localX = 0; localX < selectionWidth; localX += 1) {
+        const x = (canvasLeft + localX + 0.5) * MAP_W / width;
+        const y = (canvasTop + localY + 0.5) * MAP_H / height;
+        if (!regionContainsMapPoint(scope, x, y)) continue;
+        const offset = (localY * selectionWidth + localX) * 4;
+        if (rgba[offset + 3] === 0) continue;
+        if (rgba[offset] === RED_RGB[0]) red += 1;
+        else blue += 1;
+      }
+    }
+  }
+  return { red, blue, ...countSelectedCities(entry.cityOwners, scope) };
+}
+
+function countCompactRegion(row, bytes, scope) {
+  let red = 0;
+  let blue = 0;
+  if (row.width === MAP_W && row.height === MAP_H) {
+    for (const ownershipIndex of scope.ownershipIndexes) {
+      if (bit(bytes, ownershipIndex)) red += 1;
+      else blue += 1;
+    }
+  } else {
+    let ownershipIndex = 0;
+    for (let pixel = 0; pixel < row.width * row.height; pixel += 1) {
+      if (!bit(state.mask, pixel)) continue;
+      const x = ((pixel % row.width) + 0.5) * MAP_W / row.width;
+      const y = (Math.floor(pixel / row.width) + 0.5) * MAP_H / row.height;
+      if (regionContainsMapPoint(scope, x, y)) {
+        if (bit(bytes, ownershipIndex)) red += 1;
+        else blue += 1;
+      }
+      ownershipIndex += 1;
+    }
+  }
+
+  const ownershipIndices = getCityOwnershipIndices(row);
+  const owners = new Uint8Array(state.cityData.cities.length).fill(255);
+  for (const cityIndex of scope.cityIndexes) {
+    const ownershipIndex = ownershipIndices[cityIndex];
+    if (ownershipIndex >= 0) owners[cityIndex] = bit(bytes, ownershipIndex);
+  }
+  return { red, blue, ...countSelectedCities(owners, scope) };
+}
+
+function countLegacyRegion(row, bytes, scope) {
+  let red = 0;
+  let blue = 0;
+  if (row.width === MAP_W && row.height === MAP_H) {
+    for (const pixel of scope.pixelIndexes) {
+      if (bytes[pixel] === 1) red += 1;
+      else if (bytes[pixel] === 0) blue += 1;
+    }
+  } else {
+    for (let pixel = 0; pixel < row.width * row.height; pixel += 1) {
+      const x = ((pixel % row.width) + 0.5) * MAP_W / row.width;
+      const y = (Math.floor(pixel / row.width) + 0.5) * MAP_H / row.height;
+      if (!regionContainsMapPoint(scope, x, y)) continue;
+      if (bytes[pixel] === 1) red += 1;
+      else if (bytes[pixel] === 0) blue += 1;
+    }
+  }
+
+  const { worldSize, cities } = state.cityData;
+  const owners = new Uint8Array(cities.length).fill(255);
+  for (const cityIndex of scope.cityIndexes) {
+    const [x, y] = cities[cityIndex];
+    const px = Math.min(row.width - 1, Math.max(0, Math.floor((x * row.width) / worldSize.width)));
+    const py = Math.min(row.height - 1, Math.max(0, Math.floor((y * row.height) / worldSize.height)));
+    owners[cityIndex] = bytes[py * row.width + px];
+  }
+  return { red, blue, ...countSelectedCities(owners, scope) };
+}
+
+function setRegionStat(mapHash, stats, generation) {
+  if (!state.region.scope || state.region.scope.generation !== generation) return;
+  const current = state.region.stats.get(mapHash);
+  if (current
+      && current.red === stats.red
+      && current.blue === stats.blue
+      && current.cityRed === stats.cityRed
+      && current.cityBlue === stats.cityBlue) return;
+  state.region.stats.set(mapHash, stats);
+  scheduleAnalytics();
+}
+
+async function computeRegionStats(row, scope) {
+  const decoded = state.cache.get(row.mapHash);
+  if (decoded) {
+    try {
+      const entry = await decoded;
+      setRegionStat(row.mapHash, countRegionEntry(row, entry, scope), scope.generation);
+      return;
+    } catch { /* decode failed — fall through to a direct fetch */ }
+  }
+  const bytes = await getOwnershipBytes(row);
+  let stats;
+  if (row.encoding === "playable-bitset-zlib-v1") stats = countCompactRegion(row, bytes, scope);
+  else if (row.encoding === "raw-u8-zlib-v1") stats = countLegacyRegion(row, bytes, scope);
+  else throw new Error(`Unsupported map encoding: ${row.encoding}`);
+  setRegionStat(row.mapHash, stats, scope.generation);
+}
+
+function queueRegionStats(rows, scope = state.region.scope) {
+  if (!scope || scope.generation !== state.region.generation) return;
+  const missing = rows
+    .filter((row) => !state.region.stats.has(row.mapHash))
+    .sort((a, b) => b.capturedAt - a.capturedAt);
+  for (const row of missing) {
+    if (regionStatsQueued.has(row.mapHash)) continue;
+    regionStatsQueued.add(row.mapHash);
+    regionStatsQueue.push({ row, scope });
+  }
+  pumpRegionStats();
+}
+
+function restartRegionStats(scope) {
+  regionStatsQueue.length = 0;
+  regionStatsQueued.clear();
+  if (scope) queueRegionStats(state.rows, scope);
+}
+
+function pumpRegionStats() {
+  while (regionStatsActive < STATS_CONCURRENCY && regionStatsQueue.length > 0) {
+    const task = regionStatsQueue.shift();
+    const { row, scope } = task;
+    if (!state.region.scope
+        || scope.generation !== state.region.generation
+        || state.region.stats.has(row.mapHash)) {
+      regionStatsQueued.delete(row.mapHash);
+      continue;
+    }
+    regionStatsActive += 1;
+    computeRegionStats(row, scope)
+      .catch(() => {})
+      .finally(() => {
+        regionStatsActive -= 1;
+        if (scope.generation === state.region.generation) regionStatsQueued.delete(row.mapHash);
+        pumpRegionStats();
+      });
+  }
+}
+
 async function computeStats(row) {
   const decoded = state.cache.get(row.mapHash);
   if (decoded) {
@@ -1175,7 +1479,7 @@ async function computeStats(row) {
       return;
     } catch { /* decode failed — fall through to a direct fetch */ }
   }
-  const bytes = await inflate(await authenticatedFetch(new URL(row.mapUrl, API)));
+  const bytes = await getOwnershipBytes(row);
   if (row.encoding === "playable-bitset-zlib-v1") {
     const { red, blue } = countCompact(row, bytes);
     setStat(row.mapHash, red, blue, countCompactCities(row, bytes));
@@ -1257,39 +1561,50 @@ function chartTrendBaseline(points) {
   return baseline;
 }
 
-function renderChartStatus(points) {
+function renderChartStatus(points, loadedCount) {
   const el = els.chartStatus;
   el.replaceChildren();
   const total = state.rows.length;
-  if (total === 0 || points.length === 0) {
+  const regional = Boolean(state.region.scope);
+  const cityStatus = state.chartSeries === "cities";
+  const statusPoints = cityStatus ? points.filter((point) => point.cityShare !== null) : points;
+  if (total === 0) {
     el.className = "chart-status";
     return;
   }
-  if (points.length < total) {
-    el.textContent = `Analyzing ${points.length} / ${total} snapshots…`;
+  if (loadedCount < total) {
+    el.textContent = `${regional ? "Selected region · " : ""}Analyzing ${loadedCount} / ${total} snapshots…`;
     el.className = "chart-status";
     return;
   }
-  const latest = points[points.length - 1];
-  const margin = latest.share - (100 - latest.share);
+  if (statusPoints.length === 0) {
+    el.textContent = regional ? "Selected region has no data for this series" : "No data for this series";
+    el.className = "chart-status";
+    return;
+  }
+  const latest = statusPoints[statusPoints.length - 1];
+  const latestShare = cityStatus ? latest.cityShare : latest.share;
+  const margin = latestShare - (100 - latestShare);
   el.className = "chart-status";
+  if (regional) el.append("Selected region · ");
+  if (cityStatus) el.append("Cities · ");
   if (Math.abs(margin) < 0.005) {
     el.append("Dead heat");
   } else {
     const faction = margin > 0 ? "red" : "blue";
     const name = faction === "red" ? "Red Empire" : "Blue Republic";
-    el.append(factionSpan(`${name} leads by ${Math.abs(margin).toFixed(2)} pp`, faction, "chart-leader"));
+    el.append(factionSpan(`${name} leads by ${Math.abs(margin).toFixed(2)}%`, faction, "chart-leader"));
   }
 
-  const baseline = chartTrendBaseline(points);
+  const baseline = chartTrendBaseline(statusPoints);
   if (latest.t > baseline.t) {
-    const change = latest.share - baseline.share;
+    const change = latestShare - (cityStatus ? baseline.cityShare : baseline.share);
     const span = formatChartSpan(latest.t - baseline.t);
     el.append(" · ");
     if (Math.abs(change) >= 0.005) {
       const faction = change > 0 ? "red" : "blue";
       const name = faction === "red" ? "Red" : "Blue";
-      el.append(factionSpan(`${name} +${Math.abs(change).toFixed(2)} pp in ${span}`, faction, "chart-change"));
+      el.append(factionSpan(`${name} +${Math.abs(change).toFixed(2)}% in ${span}`, faction, "chart-change"));
     } else {
       el.append(`No change in ${span}`);
     }
@@ -1300,117 +1615,311 @@ function renderChart() {
   const svg = els.chartSvg;
   const width = Math.max(300, Math.floor(els.chartWrap.getBoundingClientRect().width) || 300);
   const height = 250;
+  const movementMode = state.chartMode === "movement";
+  const showLand = state.chartSeries !== "cities";
+  const showCities = state.chartSeries !== "land";
+  const seriesName = state.chartSeries === "both" ? "land and city" : state.chartSeries;
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.setAttribute("height", String(height));
+  svg.setAttribute("aria-label", movementMode
+    ? `${seriesName} faction advantage over time`
+    : `Red and blue ${seriesName} control over time`);
   svg.replaceChildren();
   chartHit = null;
 
   const rows = state.rows;
   const points = [];
+  let loadedCount = 0;
   for (let i = 0; i < rows.length; i += 1) {
-    const stats = state.stats.get(rows[i].mapHash);
+    const stats = analyticsStatsFor(rows[i]);
+    if (stats) loadedCount += 1;
     const share = stats ? shareOf(stats) : null;
-    if (share !== null) {
+    const cityShare = stats ? cityShareOf(stats) : null;
+    if (share !== null || (state.chartSeries === "cities" && cityShare !== null)) {
       points.push({
         i,
         t: rows[i].capturedAt,
         share,
         red: stats.red,
         blue: stats.blue,
-        cityShare: cityShareOf(stats),
+        cityShare,
         cityRed: stats.cityRed,
         cityBlue: stats.cityBlue,
       });
     }
   }
-  renderChartStatus(points);
+  renderChartStatus(points, loadedCount);
   if (points.length < 2) {
     const message = svgEl("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "chart-empty" });
-    message.textContent = rows.length === 0 ? "Waiting for snapshots…" : "Analyzing snapshots…";
+    if (rows.length === 0) message.textContent = "Waiting for snapshots…";
+    else if (loadedCount < rows.length) message.textContent = "Analyzing snapshots…";
+    else if (state.region.scope) {
+      message.textContent = state.chartSeries === "cities"
+        ? "No cities in the selected region"
+        : "No land in the selected region";
+    } else message.textContent = "Not enough snapshot data";
     svg.append(message);
     return;
   }
 
-  const pad = { top: 32, right: 66, bottom: 26, left: 12 };
+  for (const point of points) {
+    point.landMovement = point.share === null ? null : (100 - point.share) - point.share;
+    point.cityMovement = point.cityShare !== null
+      ? (100 - point.cityShare) - point.cityShare
+      : null;
+  }
+
+  const pad = {
+    top: 32,
+    right: movementMode ? 118 : 66,
+    bottom: 26,
+    left: width < 420 ? 44 : 56,
+  };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const t0 = points[0].t;
   const t1 = points[points.length - 1].t;
   const xOf = (t) => (t1 === t0 ? pad.left + plotW / 2 : pad.left + ((t - t0) / (t1 - t0)) * plotW);
 
-  // Y domain covers both lines, always includes the 50% battle line.
-  let lo = 49.5;
-  let hi = 50.5;
+  const defs = svgEl("defs", {});
+  const gridGradient = svgEl("linearGradient", {
+    id: "chart-grid-vertical-gradient",
+    x1: 0,
+    y1: pad.top,
+    x2: 0,
+    y2: pad.top + plotH,
+    gradientUnits: "userSpaceOnUse",
+  });
+  gridGradient.append(
+    svgEl("stop", { offset: "0%", "stop-color": "#3f6ce0", "stop-opacity": 0.62 }),
+    svgEl("stop", { offset: "42%", "stop-color": "#6f7fac", "stop-opacity": 0.34 }),
+    svgEl("stop", { offset: "50%", "stop-color": "#77727f", "stop-opacity": 0.28 }),
+    svgEl("stop", { offset: "58%", "stop-color": "#a76c73", "stop-opacity": 0.34 }),
+    svgEl("stop", { offset: "100%", "stop-color": "#d94141", "stop-opacity": 0.6 }),
+  );
+  defs.append(gridGradient);
+  svg.append(defs);
+
+  let lo = movementMode ? Infinity : 49.5;
+  let hi = movementMode ? -Infinity : 50.5;
   for (const p of points) {
-    lo = Math.min(lo, p.share, 100 - p.share);
-    hi = Math.max(hi, p.share, 100 - p.share);
-    if (p.cityShare !== null) {
-      lo = Math.min(lo, p.cityShare, 100 - p.cityShare);
-      hi = Math.max(hi, p.cityShare, 100 - p.cityShare);
+    if (movementMode) {
+      if (showLand) {
+        lo = Math.min(lo, p.landMovement);
+        hi = Math.max(hi, p.landMovement);
+      }
+      if (showCities && p.cityMovement !== null) {
+        lo = Math.min(lo, p.cityMovement);
+        hi = Math.max(hi, p.cityMovement);
+      }
+    } else {
+      if (showLand) {
+        lo = Math.min(lo, p.share, 100 - p.share);
+        hi = Math.max(hi, p.share, 100 - p.share);
+      }
+      if (showCities && p.cityShare !== null) {
+        lo = Math.min(lo, p.cityShare, 100 - p.cityShare);
+        hi = Math.max(hi, p.cityShare, 100 - p.cityShare);
+      }
     }
   }
-  const padY = Math.max(0.3, (hi - lo) * 0.12);
-  lo = Math.max(0, lo - padY);
-  hi = Math.min(100, hi + padY);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
+    lo = movementMode ? -0.5 : 49.5;
+    hi = movementMode ? 0.5 : 50.5;
+  }
+  const rawSpan = Math.max(movementMode ? 0.12 : 0.6, hi - lo);
+  const padY = rawSpan * (movementMode ? 0.18 : 0.12);
+  lo = movementMode ? lo - padY : Math.max(0, lo - padY);
+  hi = movementMode ? hi + padY : Math.min(100, hi + padY);
   const yOf = (v) => pad.top + (1 - (v - lo) / (hi - lo)) * plotH;
 
-  let redLine = "";
-  let blueLine = "";
-  let cityRedLine = "";
-  let cityBlueLine = "";
-  let citySegment = 0;
-  for (let k = 0; k < points.length; k += 1) {
-    const p = points[k];
-    const x = xOf(p.t).toFixed(1);
-    redLine += `${k === 0 ? "M" : "L"}${x},${yOf(p.share).toFixed(1)}`;
-    blueLine += `${k === 0 ? "M" : "L"}${x},${yOf(100 - p.share).toFixed(1)}`;
-    if (p.cityShare === null) {
-      citySegment = 0;
-    } else {
-      cityRedLine += `${citySegment === 0 ? "M" : "L"}${x},${yOf(p.cityShare).toFixed(1)}`;
-      cityBlueLine += `${citySegment === 0 ? "M" : "L"}${x},${yOf(100 - p.cityShare).toFixed(1)}`;
-      citySegment += 1;
+  const buildLine = (valueOf) => {
+    let path = "";
+    let segmentLength = 0;
+    for (const point of points) {
+      const value = valueOf(point);
+      if (value === null || !Number.isFinite(value)) {
+        segmentLength = 0;
+        continue;
+      }
+      const x = xOf(point.t).toFixed(1);
+      path += `${segmentLength === 0 ? "M" : "L"}${x},${yOf(value).toFixed(1)}`;
+      segmentLength += 1;
     }
+    return path;
+  };
+  const buildSlopeGradient = (id, valueOf) => {
+    const samples = points
+      .map((point) => ({ point, value: valueOf(point) }))
+      .filter((sample) => sample.value !== null && Number.isFinite(sample.value));
+    const slopes = samples.map((sample, index) => {
+      const before = samples[Math.max(0, index - 1)];
+      const after = samples[Math.min(samples.length - 1, index + 1)];
+      const hours = Math.max(1 / 60, (after.point.t - before.point.t) / 3600);
+      return (after.value - before.value) / hours;
+    });
+    const maxSlope = Math.max(0, ...slopes.map(Math.abs));
+    const neutral = [126, 111, 147];
+    const gradient = svgEl("linearGradient", {
+      id,
+      x1: pad.left,
+      y1: 0,
+      x2: pad.left + plotW,
+      y2: 0,
+      gradientUnits: "userSpaceOnUse",
+    });
+    for (let index = 0; index < samples.length; index += 1) {
+      const slope = slopes[index];
+      const ratio = maxSlope > 0 ? Math.sqrt(Math.abs(slope) / maxSlope) : 0;
+      const strength = Math.abs(slope) < 1e-9 ? 0 : 0.68 + ratio * 0.32;
+      const target = slope > 1e-9 ? [63, 108, 224] : slope < -1e-9 ? [217, 65, 65] : neutral;
+      const color = neutral.map((channel, colorIndex) => (
+        Math.round(channel + (target[colorIndex] - channel) * strength)
+      ));
+      const offset = t1 === t0 ? 0 : ((samples[index].point.t - t0) / (t1 - t0)) * 100;
+      gradient.append(svgEl("stop", {
+        offset: `${Math.max(0, Math.min(100, offset)).toFixed(2)}%`,
+        "stop-color": `rgb(${color.join(", ")})`,
+      }));
+    }
+    return gradient;
+  };
+  if (movementMode) {
+    if (showLand) defs.append(buildSlopeGradient("chart-land-slope-gradient", (p) => p.landMovement));
+    if (showCities) defs.append(buildSlopeGradient("chart-city-slope-gradient", (p) => p.cityMovement));
   }
+  const redLine = buildLine((p) => movementMode ? p.landMovement : p.share);
+  const blueLine = movementMode ? "" : buildLine((p) => 100 - p.share);
+  const cityRedLine = buildLine((p) => movementMode ? p.cityMovement : p.cityShare);
+  const cityBlueLine = movementMode ? "" : buildLine((p) => p.cityShare === null ? null : 100 - p.cityShare);
   const bottom = (pad.top + plotH).toFixed(1);
   const firstX = xOf(points[0].t).toFixed(1);
   const lastX = xOf(points[points.length - 1].t).toFixed(1);
-  svg.append(
-    svgEl("path", { d: `${redLine}L${lastX},${bottom}L${firstX},${bottom}Z`, class: "chart-area chart-area-red" }),
-    svgEl("path", { d: `${blueLine}L${lastX},${bottom}L${firstX},${bottom}Z`, class: "chart-area chart-area-blue" }),
-  );
+  if (movementMode) {
+    const halfPlot = plotH / 2;
+    svg.append(
+      svgEl("rect", { x: pad.left, y: pad.top, width: plotW, height: halfPlot, class: "chart-zone-blue" }),
+      svgEl("rect", { x: pad.left, y: pad.top + halfPlot, width: plotW, height: halfPlot, class: "chart-zone-red" }),
+    );
+  } else if (showLand) {
+    svg.append(
+      svgEl("path", { d: `${redLine}L${lastX},${bottom}L${firstX},${bottom}Z`, class: "chart-area chart-area-red" }),
+      svgEl("path", { d: `${blueLine}L${lastX},${bottom}L${firstX},${bottom}Z`, class: "chart-area chart-area-blue" }),
+    );
+  }
+
+  // Local midnight dividers make each campaign day easy to scan.
+  const dayCursor = new Date(t0 * 1000);
+  dayCursor.setHours(24, 0, 0, 0);
+  while (dayCursor.getTime() / 1000 < t1) {
+    const x = xOf(dayCursor.getTime() / 1000).toFixed(1);
+    svg.append(svgEl("line", {
+      x1: x,
+      x2: x,
+      y1: pad.top,
+      y2: pad.top + plotH,
+      class: "chart-day-line",
+    }));
+    dayCursor.setDate(dayCursor.getDate() + 1);
+  }
 
   // Gridlines with a step that yields a handful of lines.
   let step = 20;
-  for (const candidate of [0.25, 0.5, 1, 2, 5, 10, 20]) {
+  const stepCandidates = movementMode
+    ? [0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20]
+    : [0.25, 0.5, 1, 2, 5, 10, 20];
+  for (const candidate of stepCandidates) {
     if ((hi - lo) / candidate <= 6) {
       step = candidate;
       break;
     }
   }
+  const gridLabelElements = [];
   for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) {
-    if (Math.abs(v - 50) < 1e-9) continue; // the battle line is drawn separately
-    const y = yOf(v).toFixed(1);
-    svg.append(svgEl("line", { x1: pad.left, x2: pad.left + plotW, y1: y, y2: y, class: "chart-grid" }));
-    const label = svgEl("text", { x: pad.left + 2, y: yOf(v) - 4, class: "chart-grid-label" });
-    label.textContent = `${step < 1 ? v.toFixed(2) : Math.round(v)}%`;
-    svg.append(label);
+    const middle = movementMode ? 0 : 50;
+    if (Math.abs(v - middle) < 1e-9) continue;
+    const yValue = yOf(v);
+    const y = yValue.toFixed(1);
+    const gridClass = movementMode ? "chart-grid chart-grid-movement" : "chart-grid";
+    svg.append(svgEl("line", { x1: pad.left, x2: pad.left + plotW, y1: y, y2: y, class: gridClass }));
+    let labelText;
+    if (movementMode) {
+      const decimals = step < 0.1 ? 2 : step < 1 ? 1 : 0;
+      labelText = `${v > 0 ? "+" : ""}${v.toFixed(decimals)}%`;
+    } else {
+      labelText = `${step < 1 ? v.toFixed(2) : Math.round(v)}%`;
+    }
+    const label = svgEl("text", {
+      x: pad.left - 7,
+      y: yValue + 4,
+      "text-anchor": "end",
+      class: "chart-grid-label",
+    });
+    label.textContent = labelText;
+    gridLabelElements.push(label);
   }
-  if (lo <= 50 && hi >= 50) {
-    const y = yOf(50).toFixed(1);
+  const middle = movementMode ? 0 : 50;
+  if (lo <= middle && hi >= middle) {
+    const y = yOf(middle).toFixed(1);
     svg.append(svgEl("line", { x1: pad.left, x2: pad.left + plotW, y1: y, y2: y, class: "chart-mid" }));
-    const label = svgEl("text", { x: pad.left + 2, y: yOf(50) - 4, class: "chart-grid-label" });
-    label.textContent = "50%";
-    svg.append(label);
+    const labelText = movementMode ? "0%" : "50%";
+    const middleY = yOf(middle);
+    const label = svgEl("text", {
+      x: pad.left - 7,
+      y: middleY + 4,
+      "text-anchor": "end",
+      class: "chart-grid-label",
+    });
+    label.textContent = labelText;
+    gridLabelElements.push(label);
   }
 
-  const landKey = svgEl("line", { x1: pad.left, x2: pad.left + 22, y1: 12, y2: 12, class: "chart-line chart-line-red" });
-  const landKeyLabel = svgEl("text", { x: pad.left + 28, y: 16, class: "chart-series-label" });
-  landKeyLabel.textContent = "Land";
-  const cityKey = svgEl("line", { x1: pad.left + 78, x2: pad.left + 100, y1: 12, y2: 12, class: "chart-line chart-line-red chart-line-city" });
-  const cityKeyLabel = svgEl("text", { x: pad.left + 106, y: 16, class: "chart-series-label" });
-  cityKeyLabel.textContent = "Cities";
-  svg.append(landKey, landKeyLabel, cityKey, cityKeyLabel);
+  if (movementMode) {
+    const blueDirection = svgEl("text", {
+      x: pad.left + plotW - 5,
+      y: pad.top + 13,
+      "text-anchor": "end",
+      class: "chart-direction-label blue",
+    });
+    blueDirection.textContent = "BLUE ↑";
+    const redDirection = svgEl("text", {
+      x: pad.left + plotW - 5,
+      y: pad.top + plotH - 7,
+      "text-anchor": "end",
+      class: "chart-direction-label red",
+    });
+    redDirection.textContent = "RED ↓";
+    svg.append(blueDirection, redDirection);
+  }
+
+  const legend = [];
+  let legendX = pad.left;
+  if (showLand) {
+    legend.push(svgEl("line", {
+      x1: legendX,
+      x2: legendX + 22,
+      y1: 12,
+      y2: 12,
+      class: movementMode ? "chart-line chart-line-land-movement" : "chart-line chart-line-red",
+    }));
+    const landKeyLabel = svgEl("text", { x: legendX + 28, y: 16, class: "chart-series-label" });
+    landKeyLabel.textContent = movementMode ? "Land / pixels" : "Land";
+    legend.push(landKeyLabel);
+    legendX += movementMode ? 112 : 78;
+  }
+  if (showCities) {
+    legend.push(svgEl("line", {
+      x1: legendX,
+      x2: legendX + 22,
+      y1: 12,
+      y2: 12,
+      class: movementMode ? "chart-line chart-line-city-movement" : "chart-line chart-line-red chart-line-city",
+    }));
+    const cityKeyLabel = svgEl("text", { x: legendX + 28, y: 16, class: "chart-series-label" });
+    cityKeyLabel.textContent = "Cities";
+    legend.push(cityKeyLabel);
+  }
+  svg.append(...legend);
 
   // Time axis.
   const spanSeconds = t1 - t0;
@@ -1420,7 +1929,7 @@ function renderChart() {
       ? { month: "short", day: "numeric" }
       : { weekday: "short", hour: "2-digit", minute: "2-digit" },
   );
-  const tickCount = width < 520 ? 3 : 5;
+  const tickCount = width < 420 ? 2 : width < 520 ? 3 : 5;
   for (let k = 0; k < tickCount; k += 1) {
     const t = t0 + (spanSeconds * k) / (tickCount - 1);
     const anchor = k === 0 ? "start" : k === tickCount - 1 ? "end" : "middle";
@@ -1436,11 +1945,18 @@ function renderChart() {
     svg.append(svgEl("line", { x1: x, x2: x, y1: pad.top, y2: pad.top + plotH, class: "chart-marker" }));
     const currentPoint = points.find((p) => p.i === state.index);
     if (currentPoint) {
-      const markers = [
-        svgEl("circle", { cx: x, cy: yOf(currentPoint.share).toFixed(1), r: 4, class: "chart-dot chart-dot-red" }),
-        svgEl("circle", { cx: x, cy: yOf(100 - currentPoint.share).toFixed(1), r: 4, class: "chart-dot chart-dot-blue" }),
-      ];
-      if (currentPoint.cityShare !== null) {
+      const markers = [];
+      if (showLand && movementMode) {
+        markers.push(svgEl("circle", { cx: x, cy: yOf(currentPoint.landMovement).toFixed(1), r: 4, class: "chart-dot chart-dot-land" }));
+      } else if (showLand) {
+        markers.push(
+          svgEl("circle", { cx: x, cy: yOf(currentPoint.share).toFixed(1), r: 4, class: "chart-dot chart-dot-red" }),
+          svgEl("circle", { cx: x, cy: yOf(100 - currentPoint.share).toFixed(1), r: 4, class: "chart-dot chart-dot-blue" }),
+        );
+      }
+      if (showCities && movementMode && currentPoint.cityMovement !== null) {
+        markers.push(svgEl("rect", { x: Number(x) - 3.5, y: yOf(currentPoint.cityMovement) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-city" }));
+      } else if (showCities && !movementMode && currentPoint.cityShare !== null) {
         markers.push(
           svgEl("rect", { x: Number(x) - 3.5, y: yOf(currentPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-red" }),
           svgEl("rect", { x: Number(x) - 3.5, y: yOf(100 - currentPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-blue" }),
@@ -1450,43 +1966,105 @@ function renderChart() {
     }
   }
 
-  svg.append(
-    svgEl("path", { d: redLine, class: "chart-line chart-line-red" }),
-    svgEl("path", { d: blueLine, class: "chart-line chart-line-blue" }),
-    svgEl("path", { d: cityRedLine, class: "chart-line chart-line-red chart-line-city" }),
-    svgEl("path", { d: cityBlueLine, class: "chart-line chart-line-blue chart-line-city" }),
-  );
+  if (movementMode) {
+    if (showLand) svg.append(svgEl("path", { d: redLine, class: "chart-line chart-line-land-movement" }));
+    if (showCities) svg.append(svgEl("path", { d: cityRedLine, class: "chart-line chart-line-city-movement" }));
+  } else {
+    if (showLand) {
+      svg.append(
+        svgEl("path", { d: redLine, class: "chart-line chart-line-red" }),
+        svgEl("path", { d: blueLine, class: "chart-line chart-line-blue" }),
+      );
+    }
+    if (showCities) {
+      svg.append(
+        svgEl("path", { d: cityRedLine, class: "chart-line chart-line-red chart-line-city" }),
+        svgEl("path", { d: cityBlueLine, class: "chart-line chart-line-blue chart-line-city" }),
+      );
+    }
+  }
 
-  // Live endpoints: pulsing dots plus the current share, election-night style.
+  // Keep scale labels readable above the plotted series.
+  svg.append(...gridLabelElements);
+
+  // Live endpoints: pulsing dots plus the latest value, election-night style.
   const endPoint = points[points.length - 1];
   const endX = xOf(endPoint.t);
-  const yRed = yOf(endPoint.share);
-  const yBlue = yOf(100 - endPoint.share);
-  svg.append(
-    svgEl("circle", { cx: endX, cy: yRed, r: 8, class: "chart-pulse chart-pulse-red" }),
-    svgEl("circle", { cx: endX, cy: yBlue, r: 8, class: "chart-pulse chart-pulse-blue" }),
-    svgEl("circle", { cx: endX, cy: yRed, r: 3.5, class: "chart-dot chart-dot-red" }),
-    svgEl("circle", { cx: endX, cy: yBlue, r: 3.5, class: "chart-dot chart-dot-blue" }),
-  );
-  if (endPoint.cityShare !== null) {
-    svg.append(
-      svgEl("rect", { x: endX - 3.5, y: yOf(endPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-red chart-city-end" }),
-      svgEl("rect", { x: endX - 3.5, y: yOf(100 - endPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-blue chart-city-end" }),
-    );
+  const endpointLabels = [];
+  if (movementMode) {
+    if (showLand) {
+      const y = yOf(endPoint.landMovement);
+      svg.append(
+        svgEl("circle", { cx: endX, cy: y, r: 8, class: "chart-pulse chart-pulse-neutral" }),
+        svgEl("circle", { cx: endX, cy: y, r: 3.5, class: "chart-dot chart-dot-land" }),
+      );
+      endpointLabels.push({
+        y,
+        className: "neutral",
+        text: `Land · ${endPoint.landMovement >= 0 ? "Blue" : "Red"} +${Math.abs(endPoint.landMovement).toFixed(2)}%`,
+      });
+    }
+    if (showCities && endPoint.cityMovement !== null) {
+      const y = yOf(endPoint.cityMovement);
+      svg.append(
+        svgEl("circle", { cx: endX, cy: y, r: 8, class: "chart-pulse chart-pulse-gold" }),
+        svgEl("rect", { x: endX - 3.5, y: y - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-city chart-city-end" }),
+      );
+      endpointLabels.push({
+        y,
+        className: "gold",
+        text: `Cities · ${endPoint.cityMovement >= 0 ? "Blue" : "Red"} +${Math.abs(endPoint.cityMovement).toFixed(1)}%`,
+      });
+    }
+  } else {
+    const cityOnly = !showLand && showCities && endPoint.cityShare !== null;
+    const redValue = cityOnly ? endPoint.cityShare : endPoint.share;
+    const blueValue = 100 - redValue;
+    const yRed = yOf(redValue);
+    const yBlue = yOf(blueValue);
+    if (showLand || cityOnly) {
+      svg.append(
+        svgEl("circle", { cx: endX, cy: yRed, r: 8, class: "chart-pulse chart-pulse-red" }),
+        svgEl("circle", { cx: endX, cy: yBlue, r: 8, class: "chart-pulse chart-pulse-blue" }),
+      );
+      if (cityOnly) {
+        svg.append(
+          svgEl("rect", { x: endX - 3.5, y: yRed - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-red chart-city-end" }),
+          svgEl("rect", { x: endX - 3.5, y: yBlue - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-blue chart-city-end" }),
+        );
+      } else {
+        svg.append(
+          svgEl("circle", { cx: endX, cy: yRed, r: 3.5, class: "chart-dot chart-dot-red" }),
+          svgEl("circle", { cx: endX, cy: yBlue, r: 3.5, class: "chart-dot chart-dot-blue" }),
+        );
+      }
+      endpointLabels.push(
+        { y: yRed, className: "red", text: `${redValue.toFixed(2)}%` },
+        { y: yBlue, className: "blue", text: `${blueValue.toFixed(2)}%` },
+      );
+    }
+    if (showLand && showCities && endPoint.cityShare !== null) {
+      svg.append(
+        svgEl("rect", { x: endX - 3.5, y: yOf(endPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-red chart-city-end" }),
+        svgEl("rect", { x: endX - 3.5, y: yOf(100 - endPoint.cityShare) - 3.5, width: 7, height: 7, class: "chart-dot chart-dot-blue chart-city-end" }),
+      );
+    }
   }
-  let labelYRed = yRed;
-  let labelYBlue = yBlue;
-  if (Math.abs(labelYRed - labelYBlue) < 16) {
-    const mid = (labelYRed + labelYBlue) / 2;
-    const sign = labelYRed <= labelYBlue ? 1 : -1;
-    labelYRed = mid - 8 * sign;
-    labelYBlue = mid + 8 * sign;
+  if (endpointLabels.length === 2 && Math.abs(endpointLabels[0].y - endpointLabels[1].y) < 16) {
+    const mid = (endpointLabels[0].y + endpointLabels[1].y) / 2;
+    const sign = endpointLabels[0].y <= endpointLabels[1].y ? 1 : -1;
+    endpointLabels[0].y = mid - 8 * sign;
+    endpointLabels[1].y = mid + 8 * sign;
   }
-  const redLabel = svgEl("text", { x: endX + 8, y: labelYRed + 4, class: "chart-end-label red" });
-  redLabel.textContent = `${endPoint.share.toFixed(2)}%`;
-  const blueLabel = svgEl("text", { x: endX + 8, y: labelYBlue + 4, class: "chart-end-label blue" });
-  blueLabel.textContent = `${(100 - endPoint.share).toFixed(2)}%`;
-  svg.append(redLabel, blueLabel);
+  for (const endpoint of endpointLabels) {
+    const label = svgEl("text", {
+      x: endX + 8,
+      y: endpoint.y + 4,
+      class: `chart-end-label ${endpoint.className}`,
+    });
+    label.textContent = endpoint.text;
+    svg.append(label);
+  }
 
   const dragRange = svgEl("rect", {
     x: 0, y: pad.top, width: 0, height: plotH, class: "chart-drag-range",
@@ -1504,6 +2082,8 @@ function renderChart() {
   svg.append(dragRange, dragStartLine, dragEndLine, hoverLine);
   chartHit = {
     points: points.map((p) => ({ ...p, x: xOf(p.t) })),
+    mode: state.chartMode,
+    series: state.chartSeries,
     hoverLine,
     dragRange,
     dragStartLine,
@@ -1538,14 +2118,52 @@ function renderChartPointTooltip(point) {
   const when = document.createElement("div");
   when.className = "tt-time";
   when.textContent = timeFormat.format(new Date(point.t * 1000));
-  const red = document.createElement("div");
-  red.className = "tt-red";
-  red.textContent = `Land · Red ${point.share.toFixed(3)}%`;
-  const blue = document.createElement("div");
-  blue.className = "tt-blue";
-  blue.textContent = `Land · Blue ${(100 - point.share).toFixed(3)}%`;
-  tooltip.append(when, red, blue);
-  if (point.cityShare !== null) {
+  const showLand = chartHit?.series !== "cities";
+  const showCities = chartHit?.series !== "land";
+  if (chartHit?.mode === "movement") {
+    tooltip.append(when);
+    if (showLand) {
+      const land = document.createElement("div");
+      const landFaction = point.landMovement > 0 ? "blue" : point.landMovement < 0 ? "red" : null;
+      land.className = landFaction ? `tt-${landFaction}` : "";
+      land.textContent = Math.abs(point.landMovement) < 0.0005
+        ? "Land / pixels · No net movement"
+        : `Land / pixels · ${landFaction === "blue" ? "Blue" : "Red"} +${Math.abs(point.landMovement).toFixed(3)}%`;
+      tooltip.append(land);
+    }
+    if (showCities && point.cityMovement !== null) {
+      const cities = document.createElement("div");
+      const cityFaction = point.cityMovement > 0 ? "blue" : point.cityMovement < 0 ? "red" : null;
+      cities.className = `tt-cities${cityFaction ? ` tt-${cityFaction}` : ""}`;
+      cities.textContent = Math.abs(point.cityMovement) < 0.0005
+        ? "Cities · No net movement"
+        : `Cities · ${cityFaction === "blue" ? "Blue" : "Red"} +${Math.abs(point.cityMovement).toFixed(1)}%`;
+      tooltip.append(cities);
+    }
+    const control = document.createElement("div");
+    control.className = "tt-time";
+    control.textContent = !showLand && point.cityShare !== null
+      ? `Current cities · R ${point.cityRed} / B ${point.cityBlue}`
+      : `Current land · R ${point.share.toFixed(2)}% / B ${(100 - point.share).toFixed(2)}%`;
+    tooltip.append(control);
+    const hint = document.createElement("div");
+    hint.className = "tt-change";
+    hint.textContent = "Press and drag to compare snapshots";
+    tooltip.append(hint);
+    positionChartTooltip(point.x);
+    return;
+  }
+  tooltip.append(when);
+  if (showLand) {
+    const red = document.createElement("div");
+    red.className = "tt-red";
+    red.textContent = `Land · Red ${point.share.toFixed(3)}%`;
+    const blue = document.createElement("div");
+    blue.className = "tt-blue";
+    blue.textContent = `Land · Blue ${(100 - point.share).toFixed(3)}%`;
+    tooltip.append(red, blue);
+  }
+  if (showCities && point.cityShare !== null) {
     const cities = document.createElement("div");
     cities.className = "tt-cities";
     cities.textContent = `Cities · R ${point.cityRed} (${point.cityShare.toFixed(1)}%) / B ${point.cityBlue} (${(100 - point.cityShare).toFixed(1)}%)`;
@@ -1583,10 +2201,13 @@ function renderChartDragTooltip(first, second) {
   const duration = document.createElement("div");
   duration.className = "tt-duration";
   duration.textContent = start.i === end.i ? "Drag to another snapshot" : formatChartSpan(end.t - start.t);
-  const landChange = end.share - start.share;
-  const landGained = landChange >= 0 ? end.red - start.red : end.blue - start.blue;
-  tooltip.append(range, duration, changeLine("Land", landChange, landGained, "px"));
-  if (start.cityShare !== null && end.cityShare !== null) {
+  tooltip.append(range, duration);
+  if (chartHit?.series !== "cities") {
+    const landChange = end.share - start.share;
+    const landGained = landChange >= 0 ? end.red - start.red : end.blue - start.blue;
+    tooltip.append(changeLine("Land", landChange, landGained, "px"));
+  }
+  if (chartHit?.series !== "land" && start.cityShare !== null && end.cityShare !== null) {
     const cityChange = end.cityShare - start.cityShare;
     const citiesGained = cityChange >= 0
       ? end.cityRed - start.cityRed
@@ -1696,9 +2317,9 @@ function renderTable() {
   const frag = document.createDocumentFragment();
   for (let i = rows.length - 1; i >= 0; i -= 1) {
     const row = rows[i];
-    const stats = state.stats.get(row.mapHash);
+    const stats = analyticsStatsFor(row);
     const share = stats ? shareOf(stats) : null;
-    const prevStats = i > 0 ? state.stats.get(rows[i - 1].mapHash) : undefined;
+    const prevStats = i > 0 ? analyticsStatsFor(rows[i - 1]) : undefined;
     const prevShare = prevStats ? shareOf(prevStats) : null;
 
     const tr = document.createElement("tr");
@@ -1762,6 +2383,35 @@ function renderTable() {
 
 function setupAnalytics() {
   loadPersistedStats();
+  for (const button of els.chartModeButtons) {
+    button.addEventListener("click", () => {
+      const mode = button.dataset.chartMode;
+      if (mode !== "movement" && mode !== "control") return;
+      state.chartMode = mode;
+      for (const option of els.chartModeButtons) {
+        const active = option.dataset.chartMode === mode;
+        option.classList.toggle("is-active", active);
+        option.setAttribute("aria-pressed", String(active));
+      }
+      updateAnalyticsScopeCopy();
+      chartLeave();
+      renderChart();
+    });
+  }
+  for (const button of els.chartSeriesButtons) {
+    button.addEventListener("click", () => {
+      const series = button.dataset.chartSeries;
+      if (!["both", "land", "cities"].includes(series)) return;
+      state.chartSeries = series;
+      for (const option of els.chartSeriesButtons) {
+        const active = option.dataset.chartSeries === series;
+        option.classList.toggle("is-active", active);
+        option.setAttribute("aria-pressed", String(active));
+      }
+      chartLeave();
+      renderChart();
+    });
+  }
   els.chartWrap.addEventListener("pointerdown", chartPointerDown);
   els.chartWrap.addEventListener("pointermove", chartPointerMove);
   els.chartWrap.addEventListener("pointerup", resetChartDrag);
@@ -1931,6 +2581,7 @@ function setupViewport() {
         clearRegion();
       } else if (wasDragging) {
         state.region.selectedId = 0;
+        commitRegionAnalytics();
         updateRegionStats();
       } else {
         state.region.bounds = null;
@@ -2118,6 +2769,7 @@ async function init() {
     buildIslandIndex(mask);
     state.cityData = cityData;
     buildCityMarkers();
+    if (state.region.selectedId || state.region.bounds) commitRegionAnalytics();
     state.health = health;
     renderStatus();
     state.rows = timeline.rows.slice().reverse();
@@ -2133,6 +2785,7 @@ async function init() {
     }
     els.slider.max = String(state.rows.length - 1);
     queueStats(state.rows);
+    queueRegionStats(state.rows);
     scheduleAnalytics();
     await setIndex(state.rows.length - 1);
     prefetch(Math.max(0, state.rows.length - 4), 3);
