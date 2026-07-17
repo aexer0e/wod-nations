@@ -79,6 +79,9 @@ const state = {
   playing: false,
   playTimer: null,
   renderToken: 0,
+  activeRender: null,
+  queuedRender: null,
+  loadingTimer: null,
   mask: null,
   terrain: null,
   cityData: null,
@@ -90,7 +93,21 @@ const state = {
   overlayAlpha: 0.55,
   health: null,
   view: { scale: 1, tx: 0, ty: 0, fit: 1 },
-  region: { selecting: false, pointerId: null, start: null, bounds: null },
+  region: {
+    selecting: false,
+    pointerInside: false,
+    lastPointer: null,
+    hoveredId: 0,
+    selectedId: 0,
+    bounds: null,
+    pointerId: null,
+    start: null,
+    dragging: false,
+    labels: null,
+    islands: null,
+    overlayImage: null,
+    renderFrame: null,
+  },
   renderedFronts: null,
   frontImage: null,
   frontGlowScale: null,
@@ -561,7 +578,6 @@ function updateOverlayViews() {
   const viewBox = `${-tx / scale} ${-ty / scale} ${rect.width / scale} ${rect.height / scale}`;
   els.cityOverlay.setAttribute("viewBox", viewBox);
   els.objectiveOverlay.setAttribute("viewBox", viewBox);
-  els.regionOverlay.setAttribute("viewBox", viewBox);
 }
 
 function formatPct(value) {
@@ -613,15 +629,6 @@ function drawFighting(fronts, width, height) {
   state.renderedFronts = fronts;
 }
 
-function normalizedRegion(start, end) {
-  return {
-    left: Math.min(start.x, end.x),
-    top: Math.min(start.y, end.y),
-    right: Math.max(start.x, end.x),
-    bottom: Math.max(start.y, end.y),
-  };
-}
-
 function regionPoint(event) {
   const rect = els.viewport.getBoundingClientRect();
   const { scale, tx, ty } = state.view;
@@ -631,43 +638,221 @@ function regionPoint(event) {
   };
 }
 
+function buildIslandIndex(mask) {
+  const total = MAP_W * MAP_H;
+  const labels = new Uint32Array(total);
+  const queue = new Uint32Array(total);
+  const islands = [null]; // component ids are one-based; zero means ocean
+
+  for (let seed = 0; seed < total; seed += 1) {
+    if (labels[seed] !== 0 || !bit(mask, seed)) continue;
+    const id = islands.length;
+    let head = 0;
+    let tail = 0;
+    let pixels = 0;
+    let minX = MAP_W;
+    let minY = MAP_H;
+    let maxX = 0;
+    let maxY = 0;
+    labels[seed] = id;
+    queue[tail++] = seed;
+
+    while (head < tail) {
+      const pixel = queue[head++];
+      const x = pixel % MAP_W;
+      const y = Math.floor(pixel / MAP_W);
+      pixels += 1;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+
+      if (x > 0 && labels[pixel - 1] === 0 && bit(mask, pixel - 1)) {
+        labels[pixel - 1] = id;
+        queue[tail++] = pixel - 1;
+      }
+      if (x + 1 < MAP_W && labels[pixel + 1] === 0 && bit(mask, pixel + 1)) {
+        labels[pixel + 1] = id;
+        queue[tail++] = pixel + 1;
+      }
+      if (y > 0 && labels[pixel - MAP_W] === 0 && bit(mask, pixel - MAP_W)) {
+        labels[pixel - MAP_W] = id;
+        queue[tail++] = pixel - MAP_W;
+      }
+      if (y + 1 < MAP_H && labels[pixel + MAP_W] === 0 && bit(mask, pixel + MAP_W)) {
+        labels[pixel + MAP_W] = id;
+        queue[tail++] = pixel + MAP_W;
+      }
+    }
+
+    islands.push({ id, pixels, minX, minY, maxX, maxY });
+  }
+
+  state.region.labels = labels;
+  state.region.islands = islands;
+}
+
+function islandAtMapPoint(point) {
+  const { labels } = state.region;
+  if (!labels || point.x < 0 || point.y < 0 || point.x >= MAP_W || point.y >= MAP_H) return 0;
+  const x = Math.min(MAP_W - 1, Math.floor(point.x));
+  const y = Math.min(MAP_H - 1, Math.floor(point.y));
+  return labels[y * MAP_W + x];
+}
+
+function normalizedRegion(start, end) {
+  return {
+    left: Math.min(start.x, end.x),
+    top: Math.min(start.y, end.y),
+    right: Math.max(start.x, end.x),
+    bottom: Math.max(start.y, end.y),
+  };
+}
+
+function paintIsland(image, islandId, fill, edge) {
+  const { labels, islands } = state.region;
+  const island = islands?.[islandId];
+  if (!labels || !island) return;
+
+  const data = image.data;
+  for (let y = island.minY; y <= island.maxY; y += 1) {
+    const row = y * MAP_W;
+    for (let x = island.minX; x <= island.maxX; x += 1) {
+      const pixel = row + x;
+      if (labels[pixel] !== islandId) continue;
+      const coastline = x < 2 || x >= MAP_W - 2 || y < 2 || y >= MAP_H - 2
+        || labels[pixel - 1] !== islandId
+        || labels[pixel + 1] !== islandId
+        || labels[pixel - MAP_W] !== islandId
+        || labels[pixel + MAP_W] !== islandId
+        || labels[pixel - 2] !== islandId
+        || labels[pixel + 2] !== islandId
+        || labels[pixel - MAP_W * 2] !== islandId
+        || labels[pixel + MAP_W * 2] !== islandId;
+      const color = coastline ? edge : fill;
+      const offset = pixel * 4;
+      data[offset] = color[0];
+      data[offset + 1] = color[1];
+      data[offset + 2] = color[2];
+      data[offset + 3] = color[3];
+    }
+  }
+}
+
+function drawRegionOverlay() {
+  state.region.renderFrame = null;
+  const ctx = els.regionOverlay.getContext("2d");
+  if (!state.region.overlayImage) {
+    state.region.overlayImage = ctx.createImageData(MAP_W, MAP_H);
+  }
+  const image = state.region.overlayImage;
+  image.data.fill(0);
+
+  const { selectedId, hoveredId, bounds } = state.region;
+  if (selectedId) {
+    paintIsland(image, selectedId, [240, 169, 46, 60], [255, 253, 246, 245]);
+  }
+  if (hoveredId) {
+    paintIsland(image, hoveredId, [255, 210, 92, 82], [255, 245, 199, 255]);
+  }
+  ctx.putImageData(image, 0, 0);
+
+  if (bounds) {
+    const width = bounds.right - bounds.left;
+    const height = bounds.bottom - bounds.top;
+    ctx.fillStyle = "rgba(240, 169, 46, 0.18)";
+    ctx.fillRect(bounds.left, bounds.top, width, height);
+    ctx.strokeStyle = "#fffdf6";
+    ctx.lineWidth = Math.max(2, 4 / Math.max(state.view.scale, 0.01));
+    ctx.strokeRect(bounds.left, bounds.top, width, height);
+  }
+
+  els.regionOverlay.classList.toggle("has-highlight", Boolean(selectedId || hoveredId || bounds));
+  els.regionOverlay.classList.toggle("is-hovering", Boolean(hoveredId));
+}
+
 function renderRegionOutline() {
-  const { bounds } = state.region;
-  els.regionOverlay.replaceChildren();
-  if (!bounds) return;
-  const outline = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-  outline.setAttribute("class", "region-outline");
-  outline.setAttribute("x", bounds.left);
-  outline.setAttribute("y", bounds.top);
-  outline.setAttribute("width", bounds.right - bounds.left);
-  outline.setAttribute("height", bounds.bottom - bounds.top);
-  els.regionOverlay.append(outline);
+  if (state.region.renderFrame !== null) return;
+  state.region.renderFrame = requestAnimationFrame(drawRegionOverlay);
+}
+
+function setHoveredIsland(islandId) {
+  if (islandId === state.region.hoveredId) return;
+  state.region.hoveredId = islandId;
+  els.viewport.classList.toggle("island-hover", Boolean(islandId));
+  renderRegionOutline();
+}
+
+function refreshRegionHover() {
+  const region = state.region;
+  if (!region.selecting || region.pointerId !== null || !region.pointerInside || !region.lastPointer) {
+    setHoveredIsland(0);
+    return;
+  }
+  setHoveredIsland(islandAtMapPoint(regionPoint(region.lastPointer)));
+}
+
+function setRegionSelection(active) {
+  state.region.selecting = active;
+  els.regionSelect.classList.toggle("is-active", active);
+  els.regionSelect.setAttribute("aria-pressed", String(active));
+  els.regionSelect.textContent = active ? "Clear selection" : "Select region";
+  els.regionSelect.title = active
+    ? "Clear the selected region"
+    : "Click an island or drag a rectangular region on the map";
+  els.viewport.classList.toggle("selecting-region", active);
+  refreshRegionHover();
+}
+
+function selectIsland(islandId) {
+  if (!state.region.islands?.[islandId]) return;
+  state.region.selectedId = islandId;
+  state.region.bounds = null;
+  renderRegionOutline();
+  updateRegionStats();
 }
 
 function updateRegionStats() {
-  const { bounds } = state.region;
+  const islandId = state.region.selectedId;
+  const island = state.region.islands?.[islandId];
+  const bounds = state.region.bounds;
+  const hasSelection = Boolean(island || bounds);
   const current = state.current;
-  els.regionIntel.classList.toggle("has-selection", Boolean(bounds));
-  els.regionIntel.classList.toggle("is-selecting", state.region.selecting && !bounds);
-  els.regionStats.hidden = !bounds;
-  if (!bounds) {
-    els.regionStatus.textContent = state.region.selecting ? "Drag on map" : "No selection";
+  els.regionIntel.hidden = !hasSelection;
+  els.regionIntel.classList.toggle("has-selection", hasSelection);
+  els.regionStats.hidden = !hasSelection;
+  if (!hasSelection) {
+    els.regionStatus.textContent = "No selection";
     return;
   }
   if (!current) return;
 
-  const canvasLeft = Math.floor((bounds.left * current.entry.canvas.width) / MAP_W);
-  const canvasTop = Math.floor((bounds.top * current.entry.canvas.height) / MAP_H);
-  const canvasRight = Math.ceil((bounds.right * current.entry.canvas.width) / MAP_W);
-  const canvasBottom = Math.ceil((bounds.bottom * current.entry.canvas.height) / MAP_H);
+  const width = current.entry.canvas.width;
+  const height = current.entry.canvas.height;
+  const left = island ? island.minX : bounds.left;
+  const top = island ? island.minY : bounds.top;
+  const right = island ? island.maxX + 1 : bounds.right;
+  const bottom = island ? island.maxY + 1 : bounds.bottom;
+  const canvasLeft = Math.floor((left * width) / MAP_W);
+  const canvasTop = Math.floor((top * height) / MAP_H);
+  const canvasRight = Math.ceil((right * width) / MAP_W);
+  const canvasBottom = Math.ceil((bottom * height) / MAP_H);
+  const selectionWidth = canvasRight - canvasLeft;
+  const selectionHeight = canvasBottom - canvasTop;
   const pixels = current.entry.canvas.getContext("2d")
-    .getImageData(canvasLeft, canvasTop, canvasRight - canvasLeft, canvasBottom - canvasTop).data;
+    .getImageData(canvasLeft, canvasTop, selectionWidth, selectionHeight).data;
   let red = 0;
   let blue = 0;
-  for (let i = 0; i < pixels.length; i += 4) {
-    if (pixels[i + 3] === 0) continue;
-    if (pixels[i] === RED_RGB[0]) red += 1;
-    else blue += 1;
+  for (let y = 0; y < selectionHeight; y += 1) {
+    const mapY = Math.min(MAP_H - 1, Math.floor(((canvasTop + y + 0.5) * MAP_H) / height));
+    for (let x = 0; x < selectionWidth; x += 1) {
+      const mapX = Math.min(MAP_W - 1, Math.floor(((canvasLeft + x + 0.5) * MAP_W) / width));
+      if (island && state.region.labels[mapY * MAP_W + mapX] !== islandId) continue;
+      const offset = (y * selectionWidth + x) * 4;
+      if (pixels[offset + 3] === 0) continue;
+      if (pixels[offset] === RED_RGB[0]) red += 1;
+      else blue += 1;
+    }
   }
 
   let cityRed = 0;
@@ -676,7 +861,10 @@ function updateRegionStats() {
   cities.forEach(([x, y], index) => {
     const mapX = (x * MAP_W) / worldSize.width;
     const mapY = (y * MAP_H) / worldSize.height;
-    if (mapX < bounds.left || mapX > bounds.right || mapY < bounds.top || mapY > bounds.bottom) return;
+    const selected = island
+      ? islandAtMapPoint({ x: mapX, y: mapY }) === islandId
+      : mapX >= bounds.left && mapX <= bounds.right && mapY >= bounds.top && mapY <= bounds.bottom;
+    if (!selected) return;
     if (current.entry.cityOwners[index] === 1) cityRed += 1;
     else if (current.entry.cityOwners[index] === 0) cityBlue += 1;
   });
@@ -687,7 +875,10 @@ function updateRegionStats() {
     current.row.objectives.forEach((objective, index) => {
       if (!Array.isArray(objective)) return;
       const [y, x] = objective;
-      if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) return;
+      const selected = island
+        ? islandAtMapPoint({ x, y }) === islandId
+        : x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
+      if (!selected) return;
       if (index % 2 === 0) objectiveBlue += 1;
       else objectiveRed += 1;
     });
@@ -695,7 +886,9 @@ function updateRegionStats() {
 
   const total = red + blue;
   const redShare = total > 0 ? (red / total) * 100 : null;
-  els.regionStatus.textContent = `${Math.round(bounds.right - bounds.left)} × ${Math.round(bounds.bottom - bounds.top)} px`;
+  els.regionStatus.textContent = island
+    ? `${island.pixels.toLocaleString()} land px`
+    : `${Math.round(bounds.right - bounds.left)} × ${Math.round(bounds.bottom - bounds.top)} px`;
   els.regionRedPixels.textContent = redShare === null ? "0 px" : `${red.toLocaleString()} px (${redShare.toFixed(1)}%)`;
   els.regionBluePixels.textContent = redShare === null ? "0 px" : `${blue.toLocaleString()} px (${(100 - redShare).toFixed(1)}%)`;
   els.regionRedCities.textContent = cityRed.toLocaleString();
@@ -703,21 +896,12 @@ function updateRegionStats() {
   els.regionObjectives.textContent = `R ${objectiveRed} · B ${objectiveBlue}`;
 }
 
-function setRegionSelection(selecting) {
-  state.region.selecting = selecting;
-  els.regionSelect.classList.toggle("is-active", selecting);
-  els.regionSelect.setAttribute("aria-pressed", String(selecting));
-  els.regionSelect.textContent = selecting ? "Clear" : "Select region";
-  els.regionSelect.title = selecting ? "Clear the selected region" : "Draw a region on the map";
-  els.viewport.classList.toggle("selecting-region", selecting);
-  els.regionIntel.classList.toggle("is-selecting", selecting && !state.region.bounds);
-  if (!state.region.bounds) els.regionStatus.textContent = selecting ? "Drag on map" : "No selection";
-}
-
 function clearRegion() {
+  state.region.selectedId = 0;
   state.region.bounds = null;
-  state.region.start = null;
   state.region.pointerId = null;
+  state.region.start = null;
+  state.region.dragging = false;
   renderRegionOutline();
   updateRegionStats();
 }
@@ -733,8 +917,46 @@ function updatePanels(row) {
   if (els.newsText.textContent !== row.news) els.newsText.textContent = row.news || "No dispatches.";
 }
 
-async function setIndex(rawIndex) {
-  if (state.rows.length === 0) return;
+function pumpRenderQueue() {
+  if (state.activeRender || !state.queuedRender) return;
+
+  // Decode at most one requested frame at a time. Rapid slider input replaces
+  // the queued request below, so work cannot build up behind the pointer.
+  const request = state.queuedRender;
+  state.queuedRender = null;
+  state.activeRender = request;
+  state.loadingTimer = setTimeout(() => {
+    if (state.activeRender === request && request.token === state.renderToken) {
+      els.loading.hidden = false;
+    }
+  }, 150);
+
+  getDecoded(request.row)
+    .then((entry) => {
+      if (request.token !== state.renderToken) return;
+      state.current = { row: request.row, entry };
+      drawMap();
+      updateStats(entry);
+      updateRegionStats();
+      clearError();
+    })
+    .catch((error) => {
+      if (request.token === state.renderToken) {
+        showError(`Could not load snapshot #${request.row.id}: ${error.message}`);
+      }
+    })
+    .finally(() => {
+      clearTimeout(state.loadingTimer);
+      state.loadingTimer = null;
+      if (request.token === state.renderToken) els.loading.hidden = true;
+      state.activeRender = null;
+      request.resolve(request.token === state.renderToken);
+      pumpRenderQueue();
+    });
+}
+
+function setIndex(rawIndex) {
+  if (state.rows.length === 0) return Promise.resolve(false);
   const index = Math.max(0, Math.min(state.rows.length - 1, rawIndex));
   state.index = index;
   const row = state.rows[index];
@@ -742,21 +964,15 @@ async function setIndex(rawIndex) {
   updatePanels(row);
   scheduleAnalytics(); // keep the chart marker and log highlight in sync
   const token = ++state.renderToken;
-  const loadingTimer = setTimeout(() => { els.loading.hidden = false; }, 150);
-  try {
-    const entry = await getDecoded(row);
-    if (token !== state.renderToken) return;
-    state.current = { row, entry };
-    drawMap();
-    updateStats(entry);
-    updateRegionStats();
-    clearError();
-  } catch (error) {
-    if (token === state.renderToken) showError(`Could not load snapshot #${row.id}: ${error.message}`);
-  } finally {
-    clearTimeout(loadingTimer);
-    if (token === state.renderToken) els.loading.hidden = true;
-  }
+  clearTimeout(state.loadingTimer);
+  state.loadingTimer = null;
+  els.loading.hidden = true;
+
+  return new Promise((resolve) => {
+    if (state.queuedRender) state.queuedRender.resolve(false);
+    state.queuedRender = { row, token, resolve };
+    pumpRenderQueue();
+  });
 }
 
 function prefetch(fromIndex, count) {
@@ -782,16 +998,17 @@ async function playbackTick() {
     setPlaying(false);
     return;
   }
-  await setIndex(next);
+  const rendered = await setIndex(next);
+  if (!rendered || !state.playing) return;
   prefetch(next + 1, 3);
-  if (state.playing) {
-    state.playTimer = setTimeout(playbackTick, Number(els.playSpeed.value));
-  }
+  state.playTimer = setTimeout(playbackTick, Number(els.playSpeed.value));
 }
 
 function togglePlay() {
   if (!state.playing && state.index >= state.rows.length - 1) {
-    setIndex(0).then(() => setPlaying(true));
+    setIndex(0).then((rendered) => {
+      if (rendered) setPlaying(true);
+    });
     return;
   }
   setPlaying(!state.playing);
@@ -1590,6 +1807,7 @@ function applyView() {
     state.frontGlowScale = scale;
   }
   updateOverlayViews();
+  refreshRegionHover();
 }
 
 function fitView() {
@@ -1646,11 +1864,13 @@ function setupViewport() {
 
   els.viewport.addEventListener("pointerdown", (event) => {
     if (state.region.selecting && event.button === 0 && pointers.size === 0) {
+      event.preventDefault();
       els.viewport.setPointerCapture(event.pointerId);
+      const point = regionPoint(event);
       state.region.pointerId = event.pointerId;
-      state.region.start = regionPoint(event);
-      state.region.bounds = normalizedRegion(state.region.start, state.region.start);
-      renderRegionOutline();
+      state.region.start = { ...point, clientX: event.clientX, clientY: event.clientY };
+      state.region.dragging = false;
+      setHoveredIsland(0);
       return;
     }
     els.viewport.setPointerCapture(event.pointerId);
@@ -1663,11 +1883,24 @@ function setupViewport() {
   });
 
   els.viewport.addEventListener("pointermove", (event) => {
+    state.region.lastPointer = { clientX: event.clientX, clientY: event.clientY };
     if (state.region.pointerId === event.pointerId && state.region.start) {
-      state.region.bounds = normalizedRegion(state.region.start, regionPoint(event));
-      renderRegionOutline();
+      const distance = Math.hypot(
+        event.clientX - state.region.start.clientX,
+        event.clientY - state.region.start.clientY,
+      );
+      if (distance >= 5) {
+        if (!state.region.dragging) {
+          state.region.dragging = true;
+          state.region.selectedId = 0;
+          els.regionIntel.hidden = true;
+        }
+        state.region.bounds = normalizedRegion(state.region.start, regionPoint(event));
+        renderRegionOutline();
+      }
       return;
     }
+    refreshRegionHover();
     const previous = pointers.get(event.pointerId);
     if (!previous) return;
     const current = { x: event.clientX, y: event.clientY };
@@ -1687,13 +1920,25 @@ function setupViewport() {
     }
   });
 
-  const releasePointer = (event) => {
+  const releasePointer = (event, cancelled = false) => {
     if (state.region.pointerId === event.pointerId) {
-      const bounds = state.region.bounds;
+      const wasDragging = state.region.dragging;
+      const point = regionPoint(event);
       state.region.pointerId = null;
       state.region.start = null;
-      if (bounds && (bounds.right - bounds.left < 4 || bounds.bottom - bounds.top < 4)) clearRegion();
-      else updateRegionStats();
+      state.region.dragging = false;
+      if (cancelled) {
+        clearRegion();
+      } else if (wasDragging) {
+        state.region.selectedId = 0;
+        updateRegionStats();
+      } else {
+        state.region.bounds = null;
+        const islandId = islandAtMapPoint(point);
+        if (islandId) selectIsland(islandId);
+        else clearRegion();
+      }
+      refreshRegionHover();
       return;
     }
     pointers.delete(event.pointerId);
@@ -1701,9 +1946,20 @@ function setupViewport() {
     if (pointers.size === 0) els.viewport.classList.remove("dragging");
   };
   els.viewport.addEventListener("pointerup", releasePointer);
-  els.viewport.addEventListener("pointercancel", releasePointer);
+  els.viewport.addEventListener("pointercancel", (event) => releasePointer(event, true));
+  els.viewport.addEventListener("pointerenter", (event) => {
+    state.region.pointerInside = true;
+    state.region.lastPointer = { clientX: event.clientX, clientY: event.clientY };
+    refreshRegionHover();
+  });
+  els.viewport.addEventListener("pointerleave", () => {
+    state.region.pointerInside = false;
+    refreshRegionHover();
+  });
 
-  els.viewport.addEventListener("dblclick", fitView);
+  els.viewport.addEventListener("dblclick", () => {
+    if (!state.region.selecting) fitView();
+  });
   els.zoomIn.addEventListener("click", () => zoomCenter(1.5));
   els.zoomOut.addEventListener("click", () => zoomCenter(1 / 1.5));
   els.zoomReset.addEventListener("click", fitView);
@@ -1738,9 +1994,9 @@ function setupControls() {
     if (state.region.selecting) {
       clearRegion();
       setRegionSelection(false);
-      return;
+    } else {
+      setRegionSelection(true);
     }
-    setRegionSelection(true);
   });
 
   document.addEventListener("keydown", (event) => {
@@ -1749,6 +2005,9 @@ function setupControls() {
     if (event.code === "Space") {
       event.preventDefault();
       togglePlay();
+    } else if (event.key === "Escape" && state.region.selecting) {
+      clearRegion();
+      setRegionSelection(false);
     } else if (event.key === "ArrowLeft") {
       setPlaying(false);
       setIndex(state.index - 1);
@@ -1856,6 +2115,7 @@ async function init() {
     ]);
     state.terrain = terrain;
     state.mask = mask;
+    buildIslandIndex(mask);
     state.cityData = cityData;
     buildCityMarkers();
     state.health = health;

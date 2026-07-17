@@ -447,6 +447,7 @@ input[type="range"]::-moz-range-thumb {
 
 .viewport.dragging { cursor: grabbing; }
 .viewport.selecting-region { cursor: crosshair; }
+.viewport.selecting-region.island-hover { cursor: pointer; }
 
 .stage {
   position: absolute;
@@ -532,19 +533,26 @@ input[type="range"]::-moz-range-thumb {
 .region-overlay {
   position: absolute;
   inset: 0;
-  width: 100%;
-  height: 100%;
-  overflow: visible;
+  display: block;
+  width: 1920px;
+  height: 1080px;
+  image-rendering: pixelated;
   pointer-events: none;
+  opacity: 1;
+  will-change: opacity;
 }
 
-.region-outline {
-  fill: rgba(240, 169, 46, 0.18);
-  stroke: #fffdf6;
-  stroke-width: 5px;
-  stroke-linejoin: round;
-  paint-order: stroke fill;
-  vector-effect: non-scaling-stroke;
+.region-overlay.is-hovering {
+  animation: island-highlight-pulse 1.15s ease-in-out infinite;
+}
+
+@keyframes island-highlight-pulse {
+  0%, 100% { opacity: 0.84; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .region-overlay.is-hovering { animation: none; }
 }
 
 .map-intel {
@@ -563,6 +571,8 @@ input[type="range"]::-moz-range-thumb {
   opacity: 0.92;
   transition: opacity 0.18s ease, background 0.18s ease;
 }
+
+.map-intel[hidden] { display: none; }
 
 .map-intel:not(.has-selection) {
   top: auto;

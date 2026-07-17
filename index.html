@@ -114,7 +114,7 @@
             <span>Objective perimeters</span>
           </label>
           <div class="toolbar-group region-tools">
-            <button class="btn" id="region-select" type="button" aria-pressed="false" title="Draw a region on the map">Select region</button>
+            <button class="btn" id="region-select" type="button" aria-pressed="false" title="Click an island or drag a rectangular region on the map">Select region</button>
           </div>
         </div>
 
@@ -122,6 +122,7 @@
           <div class="stage" id="stage">
             <canvas id="map-canvas" width="1920" height="1080"></canvas>
             <canvas id="battle-overlay" width="1920" height="1080" aria-hidden="true"></canvas>
+            <canvas class="region-overlay" id="region-overlay" width="1920" height="1080" aria-hidden="true"></canvas>
           </div>
           <svg class="city-overlay" id="city-overlay" aria-hidden="true">
             <defs>
@@ -132,8 +133,7 @@
             </defs>
           </svg>
           <svg class="objective-overlay" id="objective-overlay" aria-hidden="true"></svg>
-          <svg class="region-overlay" id="region-overlay" aria-hidden="true"></svg>
-          <section class="map-intel" id="region-intel" aria-labelledby="region-title">
+          <section class="map-intel" id="region-intel" aria-labelledby="region-title" hidden>
             <div class="map-intel-head">
               <h2 id="region-title">Region Intel</h2>
               <span class="region-status" id="region-status">No selection</span>
@@ -143,6 +143,7 @@
               <div class="region-stat"><span>Blue land</span><strong class="cell-blue" id="region-blue-pixels">—</strong></div>
               <div class="region-stat"><span>Red cities</span><strong class="cell-red" id="region-red-cities">—</strong></div>
               <div class="region-stat"><span>Blue cities</span><strong class="cell-blue" id="region-blue-cities">—</strong></div>
+              <div class="region-stat region-objectives"><span>Objectives</span><strong id="region-objectives">R 0 · B 0</strong></div>
             </div>
           </section>
           <div class="map-loading" id="map-loading" hidden>
@@ -186,7 +187,7 @@
             <li><span class="swatch swatch-fighting swatch-fighting-blue"></span> Blue objective attack front</li>
             <li><span class="swatch swatch-terrain"></span> Terrain</li>
           </ul>
-          <p class="hint">Scroll to zoom, drag to pan. Use the arrow keys to step through time and the space key to play.</p>
+          <p class="hint">Scroll to zoom, drag to pan. With Select region active, click an island or drag a box. Use the arrow keys to step through time and the space key to play.</p>
         </section>
       </aside>
     </div>
