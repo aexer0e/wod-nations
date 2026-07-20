@@ -485,6 +485,20 @@ input[type="range"]::-moz-range-thumb {
   will-change: opacity;
 }
 
+/* Full-resolution chained drop shadows can exhaust WebKit's canvas/GPU
+   budget on iPhone and iPad. Keep the front visible with one fixed glow. */
+.memory-constrained #battle-overlay {
+  filter:
+    brightness(1.7)
+    saturate(1.35)
+    drop-shadow(0 0 4px rgba(255, 195, 48, 0.96));
+  animation: none;
+  will-change: auto;
+  opacity: 1;
+}
+
+.memory-constrained .map-intel { backdrop-filter: none; }
+
 #battle-overlay.is-hidden { display: none; }
 
 @keyframes battle-front-pulse {

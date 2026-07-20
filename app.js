@@ -8,10 +8,18 @@ const CITY_DATA_URL = "assets/city-points.json";
 
 const RED_RGB = [217, 65, 65];
 const BLUE_RGB = [63, 108, 224];
-const CACHE_LIMIT = 30; // decoded overlay canvases kept in memory
-const OWNERSHIP_CACHE_LIMIT = 12; // decompressed snapshots shared by map and analytics workers
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+  || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const MEMORY_CONSTRAINED = IS_IOS
+  || (Number.isFinite(navigator.deviceMemory) && navigator.deviceMemory <= 4);
+const CACHE_LIMIT = MEMORY_CONSTRAINED ? 2 : 8; // each decoded 1920x1080 canvas is about 8 MiB
+const OWNERSHIP_CACHE_LIMIT = MEMORY_CONSTRAINED ? 4 : 12;
+const PREFETCH_COUNT = MEMORY_CONSTRAINED ? 0 : 3;
 const POLL_MS = 5 * 60 * 1000;
 const SESSION_KEY = "wod-nations-access-session";
+
+if (IS_IOS) document.documentElement.classList.add("ios");
+if (MEMORY_CONSTRAINED) document.documentElement.classList.add("memory-constrained");
 
 let accessToken = readSessionToken();
 let appStarted = false;
@@ -408,7 +416,17 @@ function getDecoded(row) {
   promise.catch(() => state.cache.delete(row.mapHash));
   state.cache.set(row.mapHash, promise);
   while (state.cache.size > CACHE_LIMIT) {
-    state.cache.delete(state.cache.keys().next().value);
+    const evictedHash = state.cache.keys().next().value;
+    const evicted = state.cache.get(evictedHash);
+    state.cache.delete(evictedHash);
+    // WebKit can retain an evicted canvas backing store until its dimensions
+    // change. Release it eagerly unless it is still the displayed snapshot.
+    evicted.then((entry) => {
+      if (!state.cache.has(evictedHash) && state.current?.entry !== entry) {
+        entry.canvas.width = 1;
+        entry.canvas.height = 1;
+      }
+    }).catch(() => {});
   }
   return promise;
 }
@@ -656,6 +674,12 @@ function drawFighting(fronts, width, height) {
   }
   ctx.putImageData(state.frontImage, 0, 0);
   state.renderedFronts = fronts;
+  if (MEMORY_CONSTRAINED) {
+    // The canvas owns a copy after putImageData; keeping ImageData as well
+    // doubles this layer's memory cost on iOS.
+    state.frontImage = null;
+    state.renderedFronts = null;
+  }
 }
 
 function regionPoint(event) {
@@ -770,21 +794,30 @@ function paintIsland(image, islandId, fill, edge) {
 
 function drawRegionOverlay() {
   state.region.renderFrame = null;
-  const ctx = els.regionOverlay.getContext("2d");
-  if (!state.region.overlayImage) {
-    state.region.overlayImage = ctx.createImageData(MAP_W, MAP_H);
-  }
-  const image = state.region.overlayImage;
-  image.data.fill(0);
-
   const { selectedId, hoveredId, bounds } = state.region;
-  if (selectedId) {
-    paintIsland(image, selectedId, [240, 169, 46, 60], [255, 253, 246, 245]);
+  const hasIslandHighlight = Boolean(selectedId || hoveredId);
+  const hadHighlight = els.regionOverlay.classList.contains("has-highlight");
+  if (!hasIslandHighlight && !bounds && !state.region.overlayImage && !hadHighlight) {
+    els.regionOverlay.classList.remove("has-highlight", "is-hovering");
+    return;
   }
-  if (hoveredId) {
-    paintIsland(image, hoveredId, [255, 210, 92, 82], [255, 245, 199, 255]);
+
+  const ctx = els.regionOverlay.getContext("2d");
+  ctx.clearRect(0, 0, MAP_W, MAP_H);
+  if (hasIslandHighlight) {
+    if (!state.region.overlayImage) {
+      state.region.overlayImage = ctx.createImageData(MAP_W, MAP_H);
+    }
+    const image = state.region.overlayImage;
+    image.data.fill(0);
+    if (selectedId) {
+      paintIsland(image, selectedId, [240, 169, 46, 60], [255, 253, 246, 245]);
+    }
+    if (hoveredId) {
+      paintIsland(image, hoveredId, [255, 210, 92, 82], [255, 245, 199, 255]);
+    }
+    ctx.putImageData(image, 0, 0);
   }
-  ctx.putImageData(image, 0, 0);
 
   if (bounds) {
     const width = bounds.right - bounds.left;
@@ -1060,10 +1093,15 @@ function pumpRenderQueue() {
   getDecoded(request.row)
     .then((entry) => {
       if (request.token !== state.renderToken) return;
+      const previous = state.current;
       state.current = { row: request.row, entry };
       drawMap();
       updateStats(entry);
       updateRegionStats();
+      if (previous && previous.entry !== entry && !state.cache.has(previous.row.mapHash)) {
+        previous.entry.canvas.width = 1;
+        previous.entry.canvas.height = 1;
+      }
       clearError();
     })
     .catch((error) => {
@@ -1126,7 +1164,7 @@ async function playbackTick() {
   }
   const rendered = await setIndex(next);
   if (!rendered || !state.playing) return;
-  prefetch(next + 1, 3);
+  prefetch(next + 1, PREFETCH_COUNT);
   state.playTimer = setTimeout(playbackTick, Number(els.playSpeed.value));
 }
 
@@ -1205,7 +1243,7 @@ async function refreshLive() {
  * Counts are immutable per mapHash and persisted in localStorage. */
 
 const STATS_KEY = "wod-stats-v2";
-const STATS_CONCURRENCY = 4;
+const STATS_CONCURRENCY = MEMORY_CONSTRAINED ? 1 : 4;
 const SVG_NS_CHART = "http://www.w3.org/2000/svg";
 
 const POPCOUNT = new Uint8Array(256);
@@ -1219,6 +1257,7 @@ const regionStatsQueued = new Set();
 let regionStatsActive = 0;
 let statsPersistTimer = null;
 let analyticsTimer = 0;
+let analyticsReady = false;
 let chartHit = null; // chart points and transient hover/drag SVG elements
 let chartDrag = null; // { pointerId, start, current }
 
@@ -1521,7 +1560,7 @@ function pumpStats() {
 /* setTimeout rather than requestAnimationFrame so the chart and log still
  * fill in while the tab is hidden; the delay coalesces bursts of updates. */
 function scheduleAnalytics() {
-  if (analyticsTimer) return;
+  if (!analyticsReady || analyticsTimer) return;
   analyticsTimer = setTimeout(() => {
     analyticsTimer = 0;
     renderChart();
@@ -2335,11 +2374,11 @@ function renderTable() {
       (value) => `${value.toFixed(3)}%`,
     );
 
-    if (share === null) {
+    if (!stats) {
       addCell(tr, "num cell-flat", "…");
     } else {
-      const margin = share - (100 - share);
-      factionCell(tr, margin, Math.abs(margin).toFixed(3));
+      const leadPx = stats.red - stats.blue;
+      factionCell(tr, leadPx, Math.abs(leadPx).toLocaleString());
     }
 
     if (i === 0) {
@@ -2448,7 +2487,7 @@ function applyView() {
   els.stage.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
   // The battle canvas is transformed with the map, so compensate its filter
   // radii to keep the fighting glow prominent at every zoom level.
-  if (state.frontGlowScale !== scale) {
+  if (!MEMORY_CONSTRAINED && state.frontGlowScale !== scale) {
     const glowScale = 1 / Math.max(scale, 0.01);
     els.battleCanvas.style.setProperty("--front-glow-core", `${4 * glowScale}px`);
     els.battleCanvas.style.setProperty("--front-glow-near", `${9 * glowScale}px`);
@@ -2784,11 +2823,14 @@ async function init() {
       return;
     }
     els.slider.max = String(state.rows.length - 1);
+    await setIndex(state.rows.length - 1);
+    // Paint the current map before starting hundreds of background snapshot
+    // downloads. This avoids a large startup memory spike on mobile Safari.
+    analyticsReady = true;
     queueStats(state.rows);
     queueRegionStats(state.rows);
     scheduleAnalytics();
-    await setIndex(state.rows.length - 1);
-    prefetch(Math.max(0, state.rows.length - 4), 3);
+    prefetch(Math.max(0, state.rows.length - PREFETCH_COUNT - 1), PREFETCH_COUNT);
   } catch (error) {
     showError(`Could not reach the map service: ${error.message}`);
     return;
