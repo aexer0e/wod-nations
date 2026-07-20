@@ -248,6 +248,46 @@
         </div>
       </section>
     </section>
+
+    <!-- Player leaderboards -->
+    <section class="leaderboards" id="leaderboards" aria-labelledby="leaderboards-title" aria-busy="true">
+      <div class="leaderboards-head">
+        <div>
+          <h2 id="leaderboards-title">Player Leaderboard</h2>
+        </div>
+        <span class="leaderboard-status" id="leaderboard-status" aria-live="polite">Loading live rankings…</span>
+      </div>
+
+      <section class="card panel leaderboard-graph-card" aria-labelledby="leaderboard-graph-title">
+        <div class="panel-head leaderboard-graph-head">
+          <div>
+            <h2 id="leaderboard-graph-title">Rankings</h2>
+            <p class="panel-sub" id="leaderboard-graph-description">Comparing the current top-20 World standings.</p>
+          </div>
+          <div class="leaderboard-view-toggle" role="group" aria-label="Leaderboard metric">
+            <button type="button" class="leaderboard-view-option is-active" data-leaderboard-metric="world" aria-pressed="true">World</button>
+            <button type="button" class="leaderboard-view-option" data-leaderboard-metric="elo" aria-pressed="false">ELO</button>
+          </div>
+        </div>
+        <div class="leaderboard-graph-wrap" id="leaderboard-graph-wrap">
+          <svg id="leaderboard-graph" role="img" aria-label="Top 20 World net wins"></svg>
+        </div>
+      </section>
+
+      <section class="card panel leaderboard-timeline-card" aria-labelledby="leaderboard-timeline-title">
+        <div class="panel-head leaderboard-timeline-head">
+          <div>
+            <h2 id="leaderboard-timeline-title">Ranking Momentum</h2>
+            <p class="panel-sub" id="leaderboard-timeline-description">Seven days of World value progress for today’s top 20.</p>
+          </div>
+          <span class="leaderboard-timeline-status" id="leaderboard-timeline-status" aria-live="polite">Loading history…</span>
+        </div>
+        <div class="leaderboard-timeline-wrap" id="leaderboard-timeline-wrap">
+          <svg id="leaderboard-timeline" role="group" aria-label="Top 20 World value history"></svg>
+          <div class="chart-tooltip leaderboard-timeline-tooltip" id="leaderboard-timeline-tooltip" hidden></div>
+        </div>
+      </section>
+    </section>
   </main>
 
   <footer class="site-footer">
