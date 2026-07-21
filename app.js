@@ -2839,6 +2839,7 @@ function renderLeaderboardTimeline() {
   const plotRight = movementMode ? width - 28 : 830;
   const labelLeft = 858;
   const labelValueX = 1180;
+  const labelDeltaX = labelValueX - 64;
   const plotHeight = height - top - bottom;
   const xStart = snapshots[0]?.capturedAt ?? 0;
   const xEnd = snapshots.at(-1)?.capturedAt ?? xStart + 1;
@@ -3204,7 +3205,7 @@ function renderLeaderboardTimeline() {
       : `${player.nickname}: ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`;
     link.append(hitbox, name, value, linkTitle);
     const delta = svgEl("text", {
-      x: plotRight - 10,
+      x: labelDeltaX,
       y: labelY + 5,
       "text-anchor": "end",
       class: "leaderboard-timeline-delta",
