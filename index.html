@@ -222,22 +222,30 @@
         <div class="panel-head">
           <div class="chart-title-group">
             <h2>📈 Momentum</h2>
-            <div class="chart-series-filter" role="group" aria-label="Visible chart series">
-              <span class="chart-series-filter-label">Show</span>
-              <button type="button" class="chart-series-option is-active" data-chart-series="land" aria-pressed="true">Land</button>
-              <button type="button" class="chart-series-option" data-chart-series="cities" aria-pressed="false">Cities</button>
-              <button type="button" class="chart-series-option" data-chart-series="both" aria-pressed="false">Both</button>
-            </div>
           </div>
           <div class="chart-head-tools">
             <span class="chart-status" id="chart-status" aria-live="polite"></span>
-            <div class="chart-view-toggle" role="group" aria-label="Momentum chart view">
-              <button type="button" class="chart-view-option is-active" data-chart-mode="movement" aria-pressed="true">
-                <span class="chart-view-icon" aria-hidden="true">↗</span> Movement
-              </button>
-              <button type="button" class="chart-view-option" data-chart-mode="control" aria-pressed="false">
-                <span class="chart-view-icon" aria-hidden="true">◐</span> Control
-              </button>
+            <div class="chart-control-groups">
+              <div class="chart-series-filter" role="group" aria-label="Visible chart series">
+                <span class="chart-series-filter-label">Show</span>
+                <button type="button" class="chart-series-option is-active" data-chart-series="land" aria-pressed="true">Land</button>
+                <button type="button" class="chart-series-option" data-chart-series="cities" aria-pressed="false">Cities</button>
+                <button type="button" class="chart-series-option" data-chart-series="both" aria-pressed="false">Both</button>
+              </div>
+              <div class="chart-series-filter" role="group" aria-label="Momentum timeframe">
+                <span class="chart-series-filter-label">Range</span>
+                <button type="button" class="chart-series-option" data-chart-range="24h" aria-pressed="false">24H</button>
+                <button type="button" class="chart-series-option" data-chart-range="1w" aria-pressed="false">1W</button>
+                <button type="button" class="chart-series-option is-active" data-chart-range="all" aria-pressed="true">All</button>
+              </div>
+              <div class="chart-view-toggle" role="group" aria-label="Momentum chart view">
+                <button type="button" class="chart-view-option is-active" data-chart-mode="movement" aria-pressed="true">
+                  <span class="chart-view-icon" aria-hidden="true">↗</span> Movement
+                </button>
+                <button type="button" class="chart-view-option" data-chart-mode="control" aria-pressed="false">
+                  <span class="chart-view-icon" aria-hidden="true">◐</span> Control
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -280,7 +288,22 @@
             <h2 id="leaderboard-timeline-title">Ranking Momentum</h2>
             <p class="panel-sub" id="leaderboard-timeline-description">Seven days of World value progress for today’s top 20.</p>
           </div>
-          <span class="leaderboard-timeline-status" id="leaderboard-timeline-status" aria-live="polite">Loading history…</span>
+          <div class="leaderboard-timeline-tools">
+            <span class="leaderboard-timeline-status" id="leaderboard-timeline-status" aria-live="polite">Loading history…</span>
+            <div class="leaderboard-timeline-controls">
+              <div class="chart-series-filter" role="group" aria-label="Ranking momentum timeframe">
+                <span class="chart-series-filter-label">Range</span>
+                <button type="button" class="chart-series-option" data-leaderboard-timeline-range="24h" aria-pressed="false">24H</button>
+                <button type="button" class="chart-series-option" data-leaderboard-timeline-range="1w" aria-pressed="false">1W</button>
+                <button type="button" class="chart-series-option is-active" data-leaderboard-timeline-range="all" aria-pressed="true">All</button>
+              </div>
+              <div class="chart-series-filter" role="group" aria-label="Ranking momentum view">
+                <span class="chart-series-filter-label">View</span>
+                <button type="button" class="chart-series-option is-active" data-leaderboard-timeline-view="players" aria-pressed="true">Players</button>
+                <button type="button" class="chart-series-option" data-leaderboard-timeline-view="movement" aria-pressed="false">Movement</button>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="leaderboard-timeline-wrap" id="leaderboard-timeline-wrap">
           <svg id="leaderboard-timeline" role="group" aria-label="Top 20 World value history"></svg>

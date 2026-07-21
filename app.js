@@ -80,6 +80,7 @@ const els = {
   chartDescription: $("chart-description"),
   chartModeButtons: document.querySelectorAll("[data-chart-mode]"),
   chartSeriesButtons: document.querySelectorAll("[data-chart-series]"),
+  chartRangeButtons: document.querySelectorAll("[data-chart-range]"),
   chartWrap: $("chart-wrap"),
   chartSvg: $("chart-svg"),
   chartTooltip: $("chart-tooltip"),
@@ -93,6 +94,8 @@ const els = {
   leaderboardGraph: $("leaderboard-graph"),
   leaderboardTimelineDescription: $("leaderboard-timeline-description"),
   leaderboardTimelineStatus: $("leaderboard-timeline-status"),
+  leaderboardTimelineViewButtons: document.querySelectorAll("[data-leaderboard-timeline-view]"),
+  leaderboardTimelineRangeButtons: document.querySelectorAll("[data-leaderboard-timeline-range]"),
   leaderboardTimelineWrap: $("leaderboard-timeline-wrap"),
   leaderboardTimeline: $("leaderboard-timeline"),
   leaderboardTimelineTooltip: $("leaderboard-timeline-tooltip"),
@@ -118,6 +121,7 @@ const state = {
   stats: new Map(), // mapHash -> pixel and city counts for the chart and log
   chartMode: "movement",
   chartSeries: "land",
+  chartRange: "all",
   current: null, // {row, entry}
   overlayAlpha: 0.55,
   health: null,
@@ -131,6 +135,8 @@ const state = {
     historyError: null,
     metric: "world",
     highlightedPlayer: null,
+    timelineView: "players",
+    timelineRange: "all",
   },
   view: { scale: 1, tx: 0, ty: 0, fit: 1 },
   region: {
@@ -1596,6 +1602,7 @@ function scheduleAnalytics() {
     analyticsTimer = 0;
     renderChart();
     renderTable();
+    if (state.leaderboards.timelineView === "movement" && !leaderboardTimelineDrag) renderLeaderboardTimeline();
   }, MEMORY_CONSTRAINED ? 1000 : 60);
 }
 
@@ -1612,6 +1619,14 @@ function formatChartSpan(seconds) {
   }
   if (hours >= 1) return `${Math.round(hours)} h`;
   return `${Math.max(1, Math.round(seconds / 60))} min`;
+}
+
+function rowsForTimeRange(rows, range, timeOf) {
+  if (range === "all" || rows.length === 0) return rows;
+  const span = range === "24h" ? 24 * 3600 : range === "1w" ? 7 * 24 * 3600 : null;
+  if (span === null) return rows;
+  const latest = timeOf(rows.at(-1));
+  return rows.filter((row) => timeOf(row) >= latest - span);
 }
 
 function factionSpan(text, faction, className) {
@@ -1631,10 +1646,9 @@ function chartTrendBaseline(points) {
   return baseline;
 }
 
-function renderChartStatus(points, loadedCount) {
+function renderChartStatus(points, loadedCount, total) {
   const el = els.chartStatus;
   el.replaceChildren();
-  const total = state.rows.length;
   const regional = Boolean(state.region.scope);
   const cityStatus = state.chartSeries === "cities";
   const statusPoints = cityStatus ? points.filter((point) => point.cityShare !== null) : points;
@@ -1697,7 +1711,7 @@ function renderChart() {
   svg.replaceChildren();
   chartHit = null;
 
-  const rows = state.rows;
+  const rows = rowsForTimeRange(state.rows, state.chartRange, (row) => row.capturedAt);
   const points = [];
   let loadedCount = 0;
   for (let i = 0; i < rows.length; i += 1) {
@@ -1718,7 +1732,7 @@ function renderChart() {
       });
     }
   }
-  renderChartStatus(points, loadedCount);
+  renderChartStatus(points, loadedCount, rows.length);
   if (points.length < 2) {
     const message = svgEl("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "chart-empty" });
     if (rows.length === 0) message.textContent = "Waiting for snapshots…";
@@ -2453,6 +2467,20 @@ function renderTable() {
 
 function setupAnalytics() {
   loadPersistedStats();
+  for (const button of els.chartRangeButtons) {
+    button.addEventListener("click", () => {
+      const range = button.dataset.chartRange;
+      if (!["24h", "1w", "all"].includes(range)) return;
+      state.chartRange = range;
+      for (const option of els.chartRangeButtons) {
+        const active = option.dataset.chartRange === range;
+        option.classList.toggle("is-active", active);
+        option.setAttribute("aria-pressed", String(active));
+      }
+      chartLeave();
+      renderChart();
+    });
+  }
   for (const button of els.chartModeButtons) {
     button.addEventListener("click", () => {
       const mode = button.dataset.chartMode;
@@ -2525,6 +2553,8 @@ async function loadLeaderboardPlayerColors() {
 
 const LEADERBOARD_HISTORY_LIMIT = 336;
 let leaderboardTimelineView = null;
+let leaderboardTimelineDrag = null;
+let leaderboardTimelineSuppressClick = false;
 
 function leaderboardMetricLabel(metric) {
   return metric === "elo" ? "ELO" : "World";
@@ -2532,6 +2562,10 @@ function leaderboardMetricLabel(metric) {
 
 function leaderboardValueUnit(metric) {
   return metric === "elo" ? "ELO" : "net wins";
+}
+
+function leaderboardMovementValue(value, unit = leaderboardValueUnit(state.leaderboards.metric)) {
+  return `${value >= 0 ? "Blue" : "Red"} average leads by ${Math.abs(Math.round(value)).toLocaleString()} ${unit}`;
 }
 
 function normalizeLeaderboardHistory(rows) {
@@ -2639,6 +2673,40 @@ function leaderboardTimelinePath(points, xOf, yOf) {
   return path;
 }
 
+function leaderboardTimelineSlopeGradient(id, samples, xStart, xEnd, plotLeft, plotRight) {
+  const slopes = samples.map((sample, index) => {
+    const before = samples[Math.max(0, index - 1)];
+    const after = samples[Math.min(samples.length - 1, index + 1)];
+    const hours = Math.max(1 / 60, (after.capturedAt - before.capturedAt) / 3600);
+    return (after.value - before.value) / hours;
+  });
+  const maximumSlope = Math.max(0, ...slopes.map(Math.abs));
+  const neutral = [126, 111, 147];
+  const gradient = svgEl("linearGradient", {
+    id,
+    x1: plotLeft,
+    y1: 0,
+    x2: plotRight,
+    y2: 0,
+    gradientUnits: "userSpaceOnUse",
+  });
+  for (let index = 0; index < samples.length; index += 1) {
+    const slope = slopes[index];
+    const ratio = maximumSlope > 0 ? Math.sqrt(Math.abs(slope) / maximumSlope) : 0;
+    const strength = Math.abs(slope) < 1e-9 ? 0 : 0.68 + ratio * 0.32;
+    const target = slope > 1e-9 ? [63, 108, 224] : slope < -1e-9 ? [217, 65, 65] : neutral;
+    const color = neutral.map((channel, colorIndex) => (
+      Math.round(channel + (target[colorIndex] - channel) * strength)
+    ));
+    const offset = xEnd === xStart ? 0 : ((samples[index].capturedAt - xStart) / (xEnd - xStart)) * 100;
+    gradient.append(svgEl("stop", {
+      offset: `${Math.max(0, Math.min(100, offset)).toFixed(2)}%`,
+      "stop-color": `rgb(${color.join(", ")})`,
+    }));
+  }
+  return gradient;
+}
+
 function leaderboardTimelineStep(span, targetTicks = 6) {
   const rough = Math.max(span, 1) / targetTicks;
   const magnitude = 10 ** Math.floor(Math.log10(rough));
@@ -2682,7 +2750,6 @@ function setLeaderboardTimelineHighlight(playerKey) {
   for (const node of svg.querySelectorAll("[data-player-key]")) {
     const active = Boolean(activeKey) && node.dataset.playerKey === activeKey;
     node.classList.toggle("is-highlighted", active);
-    node.classList.toggle("is-muted", Boolean(activeKey) && !active);
   }
 }
 
@@ -2692,12 +2759,23 @@ function hideLeaderboardTimelineTooltip() {
   if (leaderboardTimelineView?.hoverDot) leaderboardTimelineView.hoverDot.setAttribute("visibility", "hidden");
 }
 
-function showLeaderboardTimelineTooltip(point, series, snapshot, event) {
+function positionLeaderboardTimelineTooltip(capturedAt) {
   const { tooltip, wrap, svg } = {
     tooltip: els.leaderboardTimelineTooltip,
     wrap: els.leaderboardTimelineWrap,
     svg: els.leaderboardTimeline,
   };
+  const wrapRect = wrap.getBoundingClientRect();
+  const svgRect = svg.getBoundingClientRect();
+  const viewX = leaderboardTimelineView.xOf(capturedAt);
+  const anchorX = wrap.scrollLeft + svgRect.left - wrapRect.left + (viewX / leaderboardTimelineView.width) * svgRect.width;
+  const minLeft = wrap.scrollLeft + 8;
+  const maxLeft = Math.max(minLeft, wrap.scrollLeft + wrap.clientWidth - tooltip.offsetWidth - 8);
+  tooltip.style.left = `${Math.max(minLeft, Math.min(anchorX + 10, maxLeft))}px`;
+}
+
+function showLeaderboardTimelineTooltip(point, series, snapshot) {
+  const tooltip = els.leaderboardTimelineTooltip;
   const time = document.createElement("div");
   time.className = "tt-time";
   time.textContent = timeFormat.format(new Date(snapshot.capturedAt * 1000));
@@ -2706,8 +2784,10 @@ function showLeaderboardTimelineTooltip(point, series, snapshot, event) {
   player.textContent = series.nickname;
   const value = document.createElement("div");
   value.textContent = point
-    ? `Rank #${point.rank} · ${Math.round(point.value).toLocaleString()} ${leaderboardValueUnit(state.leaderboards.metric)}`
-    : "Outside the top 20 at this snapshot";
+    ? (series.movement
+      ? leaderboardMovementValue(point.value)
+      : `Rank #${point.rank} · ${Math.round(point.value).toLocaleString()} ${leaderboardValueUnit(state.leaderboards.metric)}`)
+    : (series.movement ? "Faction averages unavailable at this snapshot" : "Outside the top 20 at this snapshot");
   const content = [time, player, value];
   if (point) {
     const baseline = series.points.find(Boolean);
@@ -2719,16 +2799,14 @@ function showLeaderboardTimelineTooltip(point, series, snapshot, event) {
       content.push(progress);
     }
   }
+  const hint = document.createElement("div");
+  hint.className = "tt-change";
+  hint.textContent = "Press and drag to compare snapshots";
+  content.push(hint);
   tooltip.replaceChildren(...content);
   tooltip.hidden = false;
-
-  const wrapRect = wrap.getBoundingClientRect();
-  const svgRect = svg.getBoundingClientRect();
   const viewX = leaderboardTimelineView.xOf(snapshot.capturedAt);
-  const anchorX = wrap.scrollLeft + svgRect.left - wrapRect.left + (viewX / leaderboardTimelineView.width) * svgRect.width;
-  const minLeft = wrap.scrollLeft + 8;
-  const maxLeft = Math.max(minLeft, wrap.scrollLeft + wrap.clientWidth - tooltip.offsetWidth - 8);
-  tooltip.style.left = `${Math.max(minLeft, Math.min(anchorX + 10, maxLeft))}px`;
+  positionLeaderboardTimelineTooltip(snapshot.capturedAt);
 
   leaderboardTimelineView.crosshair.setAttribute("x1", viewX.toFixed(1));
   leaderboardTimelineView.crosshair.setAttribute("x2", viewX.toFixed(1));
@@ -2745,15 +2823,20 @@ function showLeaderboardTimelineTooltip(point, series, snapshot, event) {
 
 function renderLeaderboardTimeline() {
   const metric = state.leaderboards.metric;
+  const movementMode = state.leaderboards.timelineView === "movement";
   const currentPlayers = state.leaderboards[metric].slice(0, 20);
-  const snapshots = currentLeaderboardHistory();
+  const snapshots = rowsForTimeRange(
+    currentLeaderboardHistory(),
+    state.leaderboards.timelineRange,
+    (snapshot) => snapshot.capturedAt,
+  );
   const svg = els.leaderboardTimeline;
   const width = 1200;
   const height = 650;
   const top = 38;
   const bottom = 54;
   const plotLeft = 54;
-  const plotRight = 830;
+  const plotRight = movementMode ? width - 28 : 830;
   const labelLeft = 858;
   const labelValueX = 1180;
   const plotHeight = height - top - bottom;
@@ -2763,14 +2846,19 @@ function renderLeaderboardTimeline() {
   const xOf = (capturedAt) => plotLeft + ((capturedAt - xStart) / xSpan) * (plotRight - plotLeft);
 
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  svg.setAttribute("aria-label", `Top 20 ${leaderboardMetricLabel(metric)} value history`);
+  svg.setAttribute("aria-label", movementMode
+    ? `Top 20 ${leaderboardMetricLabel(metric)} faction advantage over time with war land momentum`
+    : `Top 20 ${leaderboardMetricLabel(metric)} value history`);
   svg.replaceChildren();
   leaderboardTimelineView = null;
+  leaderboardTimelineDrag = null;
 
   const title = svgEl("title", {});
-  title.textContent = `${leaderboardMetricLabel(metric)} value momentum`;
+  title.textContent = `${leaderboardMetricLabel(metric)} ${movementMode ? "faction advantage" : "player value momentum"}`;
   const description = svgEl("desc", {});
-  description.textContent = `Lines show each current top-20 player’s ${leaderboardValueUnit(metric)} over time. Endpoint labels are spread vertically to remain readable; gaps mean the player was outside the top 20.`;
+  description.textContent = movementMode
+    ? `One slope-colored line shows the difference between Blue and Red average ${leaderboardValueUnit(metric)} within each snapshot’s actual top 20: up is Blue and down is Red. The dotted, slope-colored war land line uses an independent percentage scale.`
+    : `Lines show every player who appeared in the visible top-20 history. Latest labels remain limited to the current top 20; gaps mean the player was outside the top 20.`;
   svg.append(title, description);
 
   if (currentPlayers.length === 0 || snapshots.length === 0) {
@@ -2792,25 +2880,113 @@ function renderLeaderboardTimeline() {
     }));
     return { capturedAt: snapshot.capturedAt, players };
   });
-  const series = currentPlayers.map((player, index) => {
+  const roster = new Map();
+  currentPlayers.forEach((player, index) => {
     const key = leaderboardPlayerKey(player.nickname);
-    return {
+    roster.set(key, {
       key,
       nickname: player.nickname,
-      rank: index + 1,
+      rank: Number(player.rank) || index + 1,
       value: Number(player.value) || 0,
-      faction: metric === "world" ? leaderboardPlayerFaction(player) : "elo",
+      source: player,
+      isCurrent: true,
+      lastSeenAt: xEnd,
+    });
+  });
+  for (const snapshot of snapshotLookups) {
+    for (const [key, player] of snapshot.players) {
+      const existing = roster.get(key);
+      if (existing) {
+        existing.lastSeenAt = Math.max(existing.lastSeenAt, snapshot.capturedAt);
+        if (!existing.isCurrent) {
+          existing.nickname = player.nickname;
+          existing.rank = player.rank;
+          existing.value = player.value;
+          existing.source = player;
+        }
+      } else {
+        roster.set(key, {
+          key,
+          nickname: player.nickname,
+          rank: player.rank,
+          value: player.value,
+          source: player,
+          isCurrent: false,
+          lastSeenAt: snapshot.capturedAt,
+        });
+      }
+    }
+  }
+  const playerSeries = [...roster.values()]
+    .sort((a, b) => {
+      if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
+      if (a.isCurrent) return a.rank - b.rank;
+      return b.lastSeenAt - a.lastSeenAt || a.rank - b.rank;
+    })
+    .map((player) => ({
+      ...player,
+      faction: metric === "world" ? leaderboardPlayerFaction(player.source) : "elo",
+      teamFaction: leaderboardPlayerFaction(player.source),
       points: snapshotLookups.map((snapshot) => {
-        const historical = snapshot.players.get(key);
+        const historical = snapshot.players.get(player.key);
         return historical ? { ...historical, capturedAt: snapshot.capturedAt } : null;
       }),
-    };
-  });
+    }));
+  let series = playerSeries;
+  if (movementMode) {
+    const movementKey = "__ranking-movement__";
+    for (const snapshot of snapshotLookups) {
+      const redValues = [];
+      const blueValues = [];
+      for (const player of snapshot.players.values()) {
+        const faction = leaderboardPlayerFaction(player);
+        if (faction === "red") redValues.push(player.value);
+        else if (faction === "blue") blueValues.push(player.value);
+      }
+      if (redValues.length > 0 && blueValues.length > 0) {
+        const redAverage = redValues.reduce((sum, value) => sum + value, 0) / redValues.length;
+        const blueAverage = blueValues.reduce((sum, value) => sum + value, 0) / blueValues.length;
+        snapshot.players.set(movementKey, {
+          capturedAt: snapshot.capturedAt,
+          rank: null,
+          value: blueAverage - redAverage,
+        });
+      }
+    }
+    const movementPoints = snapshotLookups.map((snapshot) => snapshot.players.get(movementKey) || null);
+    const latestMovement = [...movementPoints].reverse().find(Boolean);
+    if (latestMovement) {
+      series = [{
+        movement: true,
+        key: movementKey,
+        nickname: "Ranking movement",
+        rank: null,
+        value: latestMovement.value,
+        faction: "movement",
+        points: movementPoints,
+      }];
+    } else series = [];
+  }
 
   const historicalValues = series.flatMap((player) => player.points.filter(Boolean).map((point) => point.value));
+  if (historicalValues.length === 0) {
+    const empty = svgEl("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "leaderboard-graph-empty" });
+    empty.textContent = movementMode
+      ? "Red and Blue faction data is needed for movement."
+      : "No player history is available for this view.";
+    svg.append(empty);
+    els.leaderboardTimelineDescription.textContent = movementMode
+      ? "Movement needs both Red and Blue faction data in the visible history."
+      : `Visible ${leaderboardMetricLabel(metric)} history for everyone who reached the top 20.`;
+    return;
+  }
   let valueMinimum = Math.min(...historicalValues);
   let valueMaximum = Math.max(...historicalValues);
-  if (valueMinimum === valueMaximum) {
+  if (movementMode) {
+    const maximumMagnitude = Math.max(1, Math.abs(valueMinimum), Math.abs(valueMaximum));
+    valueMinimum = -maximumMagnitude;
+    valueMaximum = maximumMagnitude;
+  } else if (valueMinimum === valueMaximum) {
     const padding = Math.max(5, Math.abs(valueMinimum) * 0.03);
     valueMinimum -= padding;
     valueMaximum += padding;
@@ -2820,6 +2996,14 @@ function renderLeaderboardTimeline() {
   const axisMaximum = Math.ceil(valueMaximum / valueStep) * valueStep;
   const axisSpan = Math.max(valueStep, axisMaximum - axisMinimum);
   const yOf = (value) => top + ((axisMaximum - value) / axisSpan) * plotHeight;
+
+  if (movementMode) {
+    const zeroY = yOf(0);
+    svg.append(
+      svgEl("rect", { x: plotLeft, y: top, width: plotRight - plotLeft, height: zeroY - top, class: "leaderboard-timeline-zone-blue" }),
+      svgEl("rect", { x: plotLeft, y: zeroY, width: plotRight - plotLeft, height: top + plotHeight - zeroY, class: "leaderboard-timeline-zone-red" }),
+    );
+  }
 
   for (let value = axisMinimum; value <= axisMaximum + valueStep / 2; value += valueStep) {
     const y = yOf(value);
@@ -2831,46 +3015,143 @@ function renderLeaderboardTimeline() {
       class: "leaderboard-timeline-grid major",
     }));
     const valueLabel = svgEl("text", { x: plotLeft - 12, y: y + 4, "text-anchor": "end", class: "leaderboard-timeline-axis-value" });
-    valueLabel.textContent = Math.round(value).toLocaleString();
+    valueLabel.textContent = `${movementMode && value > 0 ? "+" : ""}${Math.round(value).toLocaleString()}`;
     svg.append(valueLabel);
   }
 
+  if (movementMode) {
+    const zeroY = yOf(0);
+    svg.append(svgEl("line", {
+      x1: plotLeft,
+      x2: plotRight,
+      y1: zeroY,
+      y2: zeroY,
+      class: "leaderboard-timeline-zero",
+    }));
+    const blueDirection = svgEl("text", {
+      x: plotRight - 6,
+      y: top + 14,
+      "text-anchor": "end",
+      class: "leaderboard-timeline-direction blue",
+    });
+    blueDirection.textContent = "BLUE ↑";
+    const redDirection = svgEl("text", {
+      x: plotRight - 6,
+      y: top + plotHeight - 8,
+      "text-anchor": "end",
+      class: "leaderboard-timeline-direction red",
+    });
+    redDirection.textContent = "RED ↓";
+    svg.append(blueDirection, redDirection);
+  }
+
   const valueHeading = svgEl("text", { x: plotLeft, y: 18, class: "leaderboard-timeline-heading" });
-  valueHeading.textContent = metric === "elo" ? "ELO" : "NET WINS";
-  const latestHeading = svgEl("text", { x: labelLeft, y: 18, class: "leaderboard-timeline-heading" });
-  latestHeading.textContent = "LATEST STANDINGS";
-  svg.append(valueHeading, latestHeading, svgEl("line", {
-    x1: plotRight + 14,
-    x2: plotRight + 14,
-    y1: top - 18,
-    y2: height - bottom + 14,
-    class: "leaderboard-timeline-divider",
-  }));
+  valueHeading.textContent = movementMode
+    ? (metric === "elo" ? "AVERAGE ELO ADVANTAGE" : "AVERAGE NET-WIN ADVANTAGE")
+    : (metric === "elo" ? "ELO" : "NET WINS");
+  svg.append(valueHeading);
+  if (!movementMode) {
+    const latestHeading = svgEl("text", { x: labelLeft, y: 18, class: "leaderboard-timeline-heading" });
+    latestHeading.textContent = "LATEST STANDINGS";
+    svg.append(latestHeading, svgEl("line", {
+      x1: plotRight + 14,
+      x2: plotRight + 14,
+      y1: top - 18,
+      y2: height - bottom + 14,
+      class: "leaderboard-timeline-divider",
+    }));
+  }
+
+  let timelineDefs = null;
+  if (movementMode) {
+    const samples = series[0].points.filter(Boolean);
+    timelineDefs = svgEl("defs", {});
+    timelineDefs.append(leaderboardTimelineSlopeGradient(
+      "leaderboard-movement-slope-gradient",
+      samples,
+      xStart,
+      xEnd,
+      plotLeft,
+      plotRight,
+    ));
+    svg.append(timelineDefs);
+  }
 
   for (const player of series) {
     const path = leaderboardTimelinePath(player.points, xOf, yOf);
     if (path) {
       const line = svgEl("path", {
         d: path,
-        class: `leaderboard-timeline-line ${player.faction}${player.rank <= 3 ? " podium" : ""}`,
+        class: `leaderboard-timeline-line ${player.faction}${Number.isFinite(player.rank) && player.rank <= 3 ? " podium" : ""}`,
         "data-player-key": player.key,
       });
       const lineTitle = svgEl("title", {});
-      lineTitle.textContent = `${player.nickname}, currently rank ${player.rank} with ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`;
+      lineTitle.textContent = player.movement
+        ? `Ranking movement: ${player.value >= 0 ? "Blue" : "Red"} average leads by ${Math.abs(Math.round(player.value)).toLocaleString()} ${leaderboardValueUnit(metric)}`
+        : player.isCurrent
+          ? `${player.nickname}, currently rank ${player.rank} with ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`
+          : `${player.nickname}, last seen at rank ${player.rank} with ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`;
       line.append(lineTitle);
       svg.append(line);
     }
   }
 
+  if (movementMode) {
+    const warLandPoints = state.rows
+      .map((row) => {
+        const stats = state.stats.get(row.mapHash);
+        const share = stats ? shareOf(stats) : null;
+        return share === null || row.capturedAt < xStart || row.capturedAt > xEnd
+          ? null
+          : { capturedAt: row.capturedAt, value: (100 - share) - share };
+      })
+      .filter(Boolean);
+    if (warLandPoints.length >= 2) {
+      timelineDefs?.append(leaderboardTimelineSlopeGradient(
+        "leaderboard-war-land-slope-gradient",
+        warLandPoints,
+        xStart,
+        xEnd,
+        plotLeft,
+        plotRight,
+      ));
+      let warMinimum = Math.min(...warLandPoints.map((point) => point.value));
+      let warMaximum = Math.max(...warLandPoints.map((point) => point.value));
+      if (warMinimum === warMaximum) {
+        warMinimum -= 0.5;
+        warMaximum += 0.5;
+      }
+      const warPadding = Math.max(0.05, (warMaximum - warMinimum) * 0.08);
+      warMinimum -= warPadding;
+      warMaximum += warPadding;
+      const warYOf = (value) => top + ((warMaximum - value) / (warMaximum - warMinimum)) * plotHeight;
+      const warPath = leaderboardTimelinePath(warLandPoints, xOf, warYOf);
+      const warLine = svgEl("path", { d: warPath, class: "leaderboard-timeline-war-line" });
+      const warTitle = svgEl("title", {});
+      warTitle.textContent = "War land momentum · independently scaled land-control advantage";
+      warLine.append(warTitle);
+      const warLabel = svgEl("text", {
+        x: plotRight - 6,
+        y: 18,
+        "text-anchor": "end",
+        class: "leaderboard-timeline-war-label",
+      });
+      warLabel.textContent = "WAR LAND · INDEPENDENT SCALE";
+      svg.append(warLine, warLabel);
+    }
+  }
+
   const lastX = xOf(xEnd);
-  const labelPositions = packLeaderboardTimelineLabels(series, yOf, top, height - bottom, 25);
-  for (const player of series) {
+  const labelSeries = movementMode ? [] : series.filter((player) => player.isCurrent);
+  const labelPositions = packLeaderboardTimelineLabels(labelSeries, yOf, top, height - bottom, 25);
+  const deltaLabels = new Map();
+  for (const player of labelSeries) {
     const y = yOf(player.value);
     const labelY = labelPositions.get(player.key) ?? y;
     const dot = svgEl("circle", {
       cx: lastX,
       cy: y,
-      r: player.rank <= 3 ? 4.8 : 3.4,
+      r: Number.isFinite(player.rank) && player.rank <= 3 ? 4.8 : 4.2,
       class: `leaderboard-timeline-end-dot ${player.faction}`,
       "data-player-key": player.key,
     });
@@ -2887,26 +3168,50 @@ function renderLeaderboardTimeline() {
       href: "#leaderboards",
       class: "leaderboard-timeline-label-link",
       "data-player-key": player.key,
-      "aria-label": `${player.nickname}, rank ${player.rank}, ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`,
+      "aria-label": player.movement
+        ? `Ranking movement, ${player.value >= 0 ? "Blue" : "Red"} average leads by ${Math.abs(Math.round(player.value)).toLocaleString()} ${leaderboardValueUnit(metric)}`
+        : `${player.nickname}, rank ${player.rank}, ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`,
+    });
+    const hitbox = svgEl("rect", {
+      x: labelLeft - 10,
+      y: labelY - 13,
+      width: labelValueX - labelLeft + 20,
+      height: 26,
+      rx: 5,
+      class: "leaderboard-timeline-label-hitbox",
     });
     const name = svgEl("text", {
       x: labelLeft,
-      y: labelY + 4,
+      y: labelY + 5,
       class: `leaderboard-timeline-name ${player.faction}`,
     });
-    const shortName = player.nickname.length > 23 ? `${player.nickname.slice(0, 22)}…` : player.nickname;
-    name.textContent = `${player.rank}. ${shortName}`;
+    const shortName = player.nickname.length > 21 ? `${player.nickname.slice(0, 20)}…` : player.nickname;
+    name.textContent = player.movement
+      ? `Ranking · ${player.value >= 0 ? "Blue" : "Red"}`
+      : `${player.rank}. ${shortName}`;
     const value = svgEl("text", {
       x: labelValueX,
-      y: labelY + 4,
+      y: labelY + 5,
       "text-anchor": "end",
       class: "leaderboard-timeline-value",
     });
-    value.textContent = Math.round(player.value).toLocaleString();
+    value.textContent = player.movement
+      ? `+${Math.abs(Math.round(player.value)).toLocaleString()}`
+      : Math.round(player.value).toLocaleString();
     const linkTitle = svgEl("title", {});
-    linkTitle.textContent = `${player.nickname}: ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`;
-    link.append(name, value, linkTitle);
-    svg.append(dot, link);
+    linkTitle.textContent = player.movement
+      ? `${player.value >= 0 ? "Blue" : "Red"} average lead: ${Math.abs(Math.round(player.value)).toLocaleString()} ${leaderboardValueUnit(metric)}`
+      : `${player.nickname}: ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`;
+    link.append(hitbox, name, value, linkTitle);
+    const delta = svgEl("text", {
+      x: plotRight - 10,
+      y: labelY + 5,
+      "text-anchor": "end",
+      class: "leaderboard-timeline-delta",
+      visibility: "hidden",
+    });
+    deltaLabels.set(player.key, delta);
+    svg.append(delta, dot, link);
   }
 
   const spanSeconds = Math.max(1, xEnd - xStart);
@@ -2937,7 +3242,31 @@ function renderLeaderboardTimeline() {
     visibility: "hidden",
   });
   const hoverDot = svgEl("circle", { r: 6, class: "leaderboard-timeline-hover-dot", visibility: "hidden" });
-  svg.append(crosshair, hoverDot);
+  const dragRange = svgEl("rect", {
+    x: 0,
+    y: top - 8,
+    width: 0,
+    height: plotHeight + 16,
+    class: "leaderboard-timeline-drag-range",
+    visibility: "hidden",
+  });
+  const dragStartLine = svgEl("line", {
+    x1: 0,
+    x2: 0,
+    y1: top - 8,
+    y2: height - bottom + 8,
+    class: "leaderboard-timeline-drag-marker",
+    visibility: "hidden",
+  });
+  const dragEndLine = svgEl("line", {
+    x1: 0,
+    x2: 0,
+    y1: top - 8,
+    y2: height - bottom + 8,
+    class: "leaderboard-timeline-drag-marker",
+    visibility: "hidden",
+  });
+  svg.append(dragRange, dragStartLine, dragEndLine, crosshair, hoverDot);
 
   leaderboardTimelineView = {
     width,
@@ -2950,6 +3279,10 @@ function renderLeaderboardTimeline() {
     yOf,
     snapshots: snapshotLookups,
     series,
+    deltaLabels,
+    dragRange,
+    dragStartLine,
+    dragEndLine,
     crosshair,
     hoverDot,
   };
@@ -2958,25 +3291,25 @@ function renderLeaderboardTimeline() {
   const rangeStart = new Date(xStart * 1000);
   const rangeEnd = new Date(xEnd * 1000);
   const rangeFormat = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
-  els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · lines track actual ${leaderboardValueUnit(metric)}; gaps mean outside the top 20.`;
+  if (movementMode) {
+    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · each snapshot’s top-20 ranking advantage: up is Blue, down is Red; dotted war land uses the same direction colors on an independent scale.`;
+  } else {
+    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · ${playerSeries.length.toLocaleString()} players who reached the top 20; gaps mean outside it.`;
+  }
   els.leaderboardTimelineStatus.textContent = state.leaderboards.historyError
     ? "Update failed · showing saved history"
     : `${snapshots.length.toLocaleString()} snapshots · live`;
   els.leaderboardTimelineStatus.title = state.leaderboards.historyError || "";
 }
 
-function leaderboardTimelinePointerMove(event) {
+function leaderboardTimelineContextFromEvent(event, preferredPlayerKey = null) {
   const view = leaderboardTimelineView;
-  if (!view) return;
+  if (!view) return null;
   const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
   const rect = els.leaderboardTimeline.getBoundingClientRect();
   const x = ((event.clientX - rect.left) / rect.width) * view.width;
   const y = ((event.clientY - rect.top) / rect.height) * view.height;
-  if (x < view.plotLeft || x > view.plotRight) {
-    hideLeaderboardTimelineTooltip();
-    setLeaderboardTimelineHighlight(target?.dataset.playerKey || null);
-    return;
-  }
+  if (x < view.plotLeft || x > view.plotRight) return { target, x, y };
 
   let snapshot = view.snapshots[0];
   let bestDistance = Infinity;
@@ -2988,8 +3321,11 @@ function leaderboardTimelinePointerMove(event) {
     }
   }
 
-  let focusedSeries = state.leaderboards.highlightedPlayer
-    ? view.series.find((player) => player.key === state.leaderboards.highlightedPlayer)
+  const focusedKey = preferredPlayerKey
+    || state.leaderboards.highlightedPlayer
+    || target?.dataset.playerKey;
+  let focusedSeries = focusedKey
+    ? view.series.find((player) => player.key === focusedKey)
     : null;
   if (!focusedSeries) {
     let closestDistance = Infinity;
@@ -3003,20 +3339,196 @@ function leaderboardTimelinePointerMove(event) {
       }
     }
   }
-  if (!focusedSeries) return;
-  const point = snapshot.players.get(focusedSeries.key) || null;
-  setLeaderboardTimelineHighlight(focusedSeries.key);
-  showLeaderboardTimelineTooltip(point, focusedSeries, snapshot, event);
+  if (!focusedSeries) return { target, x, y, snapshot };
+  return {
+    target,
+    x,
+    y,
+    snapshot,
+    series: focusedSeries,
+    point: snapshot.players.get(focusedSeries.key) || null,
+  };
+}
+
+function renderLeaderboardTimelineDragTooltip(series, firstSnapshot, secondSnapshot) {
+  const [start, end] = firstSnapshot.capturedAt <= secondSnapshot.capturedAt
+    ? [firstSnapshot, secondSnapshot]
+    : [secondSnapshot, firstSnapshot];
+  const startPoint = start.players.get(series.key) || null;
+  const endPoint = end.players.get(series.key) || null;
+  const tooltip = els.leaderboardTimelineTooltip;
+  const range = document.createElement("div");
+  range.className = "tt-time tt-range-time";
+  range.textContent = `${timeFormat.format(new Date(start.capturedAt * 1000))} → ${timeFormat.format(new Date(end.capturedAt * 1000))}`;
+  const duration = document.createElement("div");
+  duration.className = "tt-duration";
+  duration.textContent = start === end ? "Drag to another snapshot" : formatChartSpan(end.capturedAt - start.capturedAt);
+  const player = document.createElement("div");
+  player.className = "leaderboard-tooltip-player";
+  player.textContent = series.nickname;
+  const unit = leaderboardValueUnit(state.leaderboards.metric);
+  const startValue = document.createElement("div");
+  startValue.textContent = startPoint
+    ? (series.movement
+      ? `Start · ${leaderboardMovementValue(startPoint.value, unit)}`
+      : `Start · #${startPoint.rank} · ${Math.round(startPoint.value).toLocaleString()} ${unit}`)
+    : (series.movement ? "Start · Faction averages unavailable" : "Start · Outside the top 20");
+  const endValue = document.createElement("div");
+  endValue.textContent = endPoint
+    ? (series.movement
+      ? `End · ${leaderboardMovementValue(endPoint.value, unit)}`
+      : `End · #${endPoint.rank} · ${Math.round(endPoint.value).toLocaleString()} ${unit}`)
+    : (series.movement ? "End · Faction averages unavailable" : "End · Outside the top 20");
+  const content = [range, duration, player, startValue, endValue];
+
+  if (startPoint && endPoint) {
+    const valueChange = Math.round(endPoint.value - startPoint.value);
+    const progress = document.createElement("div");
+    progress.className = `tt-change-value ${valueChange > 0 ? "leaderboard-progress-up" : valueChange < 0 ? "leaderboard-progress-down" : ""}`;
+    progress.textContent = `Value change · ${valueChange > 0 ? "+" : ""}${valueChange.toLocaleString()}`;
+    content.push(progress);
+    if (!series.movement) {
+      const rankChange = startPoint.rank - endPoint.rank;
+      const ranking = document.createElement("div");
+      ranking.className = `tt-change ${rankChange > 0 ? "leaderboard-progress-up" : rankChange < 0 ? "leaderboard-progress-down" : ""}`;
+      ranking.textContent = rankChange === 0
+        ? `Rank unchanged · #${endPoint.rank}`
+        : `Rank change · ${rankChange > 0 ? "↑" : "↓"}${Math.abs(rankChange)} (#${startPoint.rank} → #${endPoint.rank})`;
+      content.push(ranking);
+    }
+  } else if (!startPoint && endPoint) {
+    const progress = document.createElement("div");
+    progress.className = "tt-change leaderboard-progress-up";
+    progress.textContent = series.movement
+      ? "Faction averages became available"
+      : `Entered the top 20 at #${endPoint.rank}`;
+    content.push(progress);
+  } else if (startPoint && !endPoint) {
+    const progress = document.createElement("div");
+    progress.className = "tt-change leaderboard-progress-down";
+    progress.textContent = series.movement ? "Faction averages became unavailable" : "Exited the top 20";
+    content.push(progress);
+  }
+
+  tooltip.replaceChildren(...content);
+  tooltip.hidden = false;
+  positionLeaderboardTimelineTooltip(secondSnapshot.capturedAt);
+}
+
+function updateLeaderboardTimelineDrag(snapshot) {
+  const drag = leaderboardTimelineDrag;
+  const view = leaderboardTimelineView;
+  if (!drag || !view || !snapshot) return;
+  drag.currentSnapshot = snapshot;
+  const startX = view.xOf(drag.startSnapshot.capturedAt);
+  const endX = view.xOf(snapshot.capturedAt);
+  view.crosshair.setAttribute("visibility", "hidden");
+  view.hoverDot.setAttribute("visibility", "hidden");
+  view.dragRange.setAttribute("x", Math.min(startX, endX).toFixed(1));
+  view.dragRange.setAttribute("width", Math.abs(endX - startX).toFixed(1));
+  view.dragStartLine.setAttribute("x1", startX.toFixed(1));
+  view.dragStartLine.setAttribute("x2", startX.toFixed(1));
+  view.dragEndLine.setAttribute("x1", endX.toFixed(1));
+  view.dragEndLine.setAttribute("x2", endX.toFixed(1));
+  for (const element of [view.dragRange, view.dragStartLine, view.dragEndLine]) {
+    element.removeAttribute("visibility");
+  }
+  const [rangeStart, rangeEnd] = drag.startSnapshot.capturedAt <= snapshot.capturedAt
+    ? [drag.startSnapshot, snapshot]
+    : [snapshot, drag.startSnapshot];
+  for (const series of view.series) {
+    const startPoint = rangeStart.players.get(series.key) || null;
+    const endPoint = rangeEnd.players.get(series.key) || null;
+    const deltaLabel = view.deltaLabels.get(series.key);
+    if (!deltaLabel) continue;
+    if (startPoint && endPoint) {
+      const delta = Math.round(endPoint.value - startPoint.value);
+      deltaLabel.textContent = `${delta >= 0 ? "+" : ""}${delta.toLocaleString()}`;
+    } else if (!startPoint && endPoint) deltaLabel.textContent = "IN";
+    else if (startPoint && !endPoint) deltaLabel.textContent = "OUT";
+    else deltaLabel.textContent = "—";
+    deltaLabel.removeAttribute("visibility");
+  }
+  setLeaderboardTimelineHighlight(drag.series.key);
+  renderLeaderboardTimelineDragTooltip(drag.series, drag.startSnapshot, snapshot);
+}
+
+function leaderboardTimelinePointerDown(event) {
+  if (event.button !== 0 || leaderboardTimelineDrag) return;
+  const context = leaderboardTimelineContextFromEvent(event);
+  if (!context?.snapshot || !context.series) return;
+  leaderboardTimelineDrag = {
+    pointerId: event.pointerId,
+    series: context.series,
+    startSnapshot: context.snapshot,
+    currentSnapshot: context.snapshot,
+  };
+  els.leaderboardTimeline.setPointerCapture(event.pointerId);
+  updateLeaderboardTimelineDrag(context.snapshot);
+  event.preventDefault();
+}
+
+function leaderboardTimelinePointerMove(event) {
+  const context = leaderboardTimelineContextFromEvent(event, leaderboardTimelineDrag?.series.key);
+  if (!context) return;
+  if (leaderboardTimelineDrag && event.pointerId === leaderboardTimelineDrag.pointerId) {
+    if (context.snapshot) updateLeaderboardTimelineDrag(context.snapshot);
+    return;
+  }
+  if (!context.snapshot) {
+    hideLeaderboardTimelineTooltip();
+    setLeaderboardTimelineHighlight(context.target?.dataset.playerKey || null);
+    return;
+  }
+  if (!context.series) return;
+  setLeaderboardTimelineHighlight(context.series.key);
+  showLeaderboardTimelineTooltip(context.point, context.series, context.snapshot);
+}
+
+function resetLeaderboardTimelineDrag(event) {
+  const drag = leaderboardTimelineDrag;
+  if (!drag || (event && event.pointerId !== drag.pointerId)) return;
+  const pointerId = drag.pointerId;
+  const draggedAcrossSnapshots = drag.startSnapshot !== drag.currentSnapshot;
+  leaderboardTimelineDrag = null;
+  if (els.leaderboardTimeline.hasPointerCapture(pointerId)) {
+    els.leaderboardTimeline.releasePointerCapture(pointerId);
+  }
+  if (leaderboardTimelineView) {
+    for (const element of [
+      leaderboardTimelineView.dragRange,
+      leaderboardTimelineView.dragStartLine,
+      leaderboardTimelineView.dragEndLine,
+    ]) element.setAttribute("visibility", "hidden");
+    for (const label of leaderboardTimelineView.deltaLabels.values()) {
+      label.setAttribute("visibility", "hidden");
+    }
+  }
+  if (draggedAcrossSnapshots) {
+    leaderboardTimelineSuppressClick = true;
+    setTimeout(() => { leaderboardTimelineSuppressClick = false; }, 0);
+  }
+  hideLeaderboardTimelineTooltip();
+  setLeaderboardTimelineHighlight();
 }
 
 function setupLeaderboardTimelineInteractions() {
   const svg = els.leaderboardTimeline;
+  svg.addEventListener("pointerdown", leaderboardTimelinePointerDown);
   svg.addEventListener("pointermove", leaderboardTimelinePointerMove);
+  svg.addEventListener("pointerup", resetLeaderboardTimelineDrag);
+  svg.addEventListener("pointercancel", resetLeaderboardTimelineDrag);
   svg.addEventListener("pointerleave", () => {
+    if (leaderboardTimelineDrag) return;
     hideLeaderboardTimelineTooltip();
     setLeaderboardTimelineHighlight();
   });
   svg.addEventListener("click", (event) => {
+    if (leaderboardTimelineSuppressClick) {
+      event.preventDefault();
+      leaderboardTimelineSuppressClick = false;
+      return;
+    }
     const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
     if (!target) {
       state.leaderboards.highlightedPlayer = null;
@@ -3041,7 +3553,31 @@ function setupLeaderboardTimelineInteractions() {
   });
 }
 
+function updateLeaderboardTimelineControls() {
+  for (const button of els.leaderboardTimelineViewButtons) {
+    const active = button.dataset.leaderboardTimelineView === state.leaderboards.timelineView;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  for (const button of els.leaderboardTimelineRangeButtons) {
+    const active = button.dataset.leaderboardTimelineRange === state.leaderboards.timelineRange;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+}
+
 function setupLeaderboards() {
+  for (const button of els.leaderboardTimelineRangeButtons) {
+    button.addEventListener("click", () => {
+      const range = button.dataset.leaderboardTimelineRange;
+      if (!["24h", "1w", "all"].includes(range)) return;
+      state.leaderboards.timelineRange = range;
+      state.leaderboards.highlightedPlayer = null;
+      hideLeaderboardTimelineTooltip();
+      updateLeaderboardTimelineControls();
+      renderLeaderboardTimeline();
+    });
+  }
   for (const button of els.leaderboardMetricButtons) {
     button.addEventListener("click", () => {
       const metric = button.dataset.leaderboardMetric;
@@ -3058,7 +3594,19 @@ function setupLeaderboards() {
       renderLeaderboardTimeline();
     });
   }
+  for (const button of els.leaderboardTimelineViewButtons) {
+    button.addEventListener("click", () => {
+      const view = button.dataset.leaderboardTimelineView;
+      if (view !== "movement" && view !== "players") return;
+      state.leaderboards.timelineView = view;
+      state.leaderboards.highlightedPlayer = null;
+      hideLeaderboardTimelineTooltip();
+      updateLeaderboardTimelineControls();
+      renderLeaderboardTimeline();
+    });
+  }
   setupLeaderboardTimelineInteractions();
+  updateLeaderboardTimelineControls();
   renderLeaderboardGraph();
   renderLeaderboardTimeline();
 }
