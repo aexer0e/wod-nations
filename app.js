@@ -2565,7 +2565,7 @@ function leaderboardValueUnit(metric) {
 }
 
 function leaderboardMovementValue(value, unit = leaderboardValueUnit(state.leaderboards.metric)) {
-  return `${value >= 0 ? "Blue" : "Red"} average leads by ${Math.abs(Math.round(value)).toLocaleString()} ${unit}`;
+  return `${value >= 0 ? "Blue" : "Red"} top-20 total leads by ${Math.abs(Math.round(value)).toLocaleString()} ${unit}`;
 }
 
 function normalizeLeaderboardHistory(rows) {
@@ -2787,7 +2787,7 @@ function showLeaderboardTimelineTooltip(point, series, snapshot) {
     ? (series.movement
       ? leaderboardMovementValue(point.value)
       : `Rank #${point.rank} · ${Math.round(point.value).toLocaleString()} ${leaderboardValueUnit(state.leaderboards.metric)}`)
-    : (series.movement ? "Faction averages unavailable at this snapshot" : "Outside the top 20 at this snapshot");
+    : (series.movement ? "Faction totals unavailable at this snapshot" : "Outside the top 20 at this snapshot");
   const content = [time, player, value];
   if (point) {
     const baseline = series.points.find(Boolean);
@@ -2857,7 +2857,7 @@ function renderLeaderboardTimeline() {
   title.textContent = `${leaderboardMetricLabel(metric)} ${movementMode ? "faction advantage" : "player value momentum"}`;
   const description = svgEl("desc", {});
   description.textContent = movementMode
-    ? `One slope-colored line shows the difference between Blue and Red average ${leaderboardValueUnit(metric)} within each snapshot’s actual top 20: up is Blue and down is Red. The dotted, slope-colored war land line uses an independent percentage scale.`
+    ? `One slope-colored line shows combined Blue ${leaderboardValueUnit(metric)} minus combined Red ${leaderboardValueUnit(metric)} within each snapshot’s actual top 20: up is Blue and down is Red. The dotted, slope-colored war land line uses an independent percentage scale.`
     : `Lines show every player who appeared in the visible top-20 history. Latest labels remain limited to the current top 20; gaps mean the player was outside the top 20.`;
   svg.append(title, description);
 
@@ -2944,12 +2944,12 @@ function renderLeaderboardTimeline() {
         else if (faction === "blue") blueValues.push(player.value);
       }
       if (redValues.length > 0 && blueValues.length > 0) {
-        const redAverage = redValues.reduce((sum, value) => sum + value, 0) / redValues.length;
-        const blueAverage = blueValues.reduce((sum, value) => sum + value, 0) / blueValues.length;
+        const redTotal = redValues.reduce((sum, value) => sum + value, 0);
+        const blueTotal = blueValues.reduce((sum, value) => sum + value, 0);
         snapshot.players.set(movementKey, {
           capturedAt: snapshot.capturedAt,
           rank: null,
-          value: blueAverage - redAverage,
+          value: blueTotal - redTotal,
         });
       }
     }
@@ -3047,7 +3047,7 @@ function renderLeaderboardTimeline() {
 
   const valueHeading = svgEl("text", { x: plotLeft, y: 18, class: "leaderboard-timeline-heading" });
   valueHeading.textContent = movementMode
-    ? (metric === "elo" ? "AVERAGE ELO ADVANTAGE" : "AVERAGE NET-WIN ADVANTAGE")
+    ? (metric === "elo" ? "TOP-20 ELO DIFFERENCE" : "TOP-20 NET-WIN DIFFERENCE")
     : (metric === "elo" ? "ELO" : "NET WINS");
   svg.append(valueHeading);
   if (!movementMode) {
@@ -3087,7 +3087,7 @@ function renderLeaderboardTimeline() {
       });
       const lineTitle = svgEl("title", {});
       lineTitle.textContent = player.movement
-        ? `Ranking movement: ${player.value >= 0 ? "Blue" : "Red"} average leads by ${Math.abs(Math.round(player.value)).toLocaleString()} ${leaderboardValueUnit(metric)}`
+        ? `Ranking movement: ${leaderboardMovementValue(player.value)}`
         : player.isCurrent
           ? `${player.nickname}, currently rank ${player.rank} with ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`
           : `${player.nickname}, last seen at rank ${player.rank} with ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`;
@@ -3169,7 +3169,7 @@ function renderLeaderboardTimeline() {
       class: "leaderboard-timeline-label-link",
       "data-player-key": player.key,
       "aria-label": player.movement
-        ? `Ranking movement, ${player.value >= 0 ? "Blue" : "Red"} average leads by ${Math.abs(Math.round(player.value)).toLocaleString()} ${leaderboardValueUnit(metric)}`
+        ? `Ranking movement, ${leaderboardMovementValue(player.value)}`
         : `${player.nickname}, rank ${player.rank}, ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`,
     });
     const hitbox = svgEl("rect", {
@@ -3200,7 +3200,7 @@ function renderLeaderboardTimeline() {
       : Math.round(player.value).toLocaleString();
     const linkTitle = svgEl("title", {});
     linkTitle.textContent = player.movement
-      ? `${player.value >= 0 ? "Blue" : "Red"} average lead: ${Math.abs(Math.round(player.value)).toLocaleString()} ${leaderboardValueUnit(metric)}`
+      ? leaderboardMovementValue(player.value)
       : `${player.nickname}: ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`;
     link.append(hitbox, name, value, linkTitle);
     const delta = svgEl("text", {
@@ -3292,7 +3292,7 @@ function renderLeaderboardTimeline() {
   const rangeEnd = new Date(xEnd * 1000);
   const rangeFormat = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
   if (movementMode) {
-    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · each snapshot’s top-20 ranking advantage: up is Blue, down is Red; dotted war land uses the same direction colors on an independent scale.`;
+    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · combined Blue minus combined Red within each snapshot’s top 20: up is Blue, down is Red; dotted war land uses the same direction colors on an independent scale.`;
   } else {
     els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · ${playerSeries.length.toLocaleString()} players who reached the top 20; gaps mean outside it.`;
   }
@@ -3372,13 +3372,13 @@ function renderLeaderboardTimelineDragTooltip(series, firstSnapshot, secondSnaps
     ? (series.movement
       ? `Start · ${leaderboardMovementValue(startPoint.value, unit)}`
       : `Start · #${startPoint.rank} · ${Math.round(startPoint.value).toLocaleString()} ${unit}`)
-    : (series.movement ? "Start · Faction averages unavailable" : "Start · Outside the top 20");
+    : (series.movement ? "Start · Faction totals unavailable" : "Start · Outside the top 20");
   const endValue = document.createElement("div");
   endValue.textContent = endPoint
     ? (series.movement
       ? `End · ${leaderboardMovementValue(endPoint.value, unit)}`
       : `End · #${endPoint.rank} · ${Math.round(endPoint.value).toLocaleString()} ${unit}`)
-    : (series.movement ? "End · Faction averages unavailable" : "End · Outside the top 20");
+    : (series.movement ? "End · Faction totals unavailable" : "End · Outside the top 20");
   const content = [range, duration, player, startValue, endValue];
 
   if (startPoint && endPoint) {
@@ -3400,13 +3400,13 @@ function renderLeaderboardTimelineDragTooltip(series, firstSnapshot, secondSnaps
     const progress = document.createElement("div");
     progress.className = "tt-change leaderboard-progress-up";
     progress.textContent = series.movement
-      ? "Faction averages became available"
+      ? "Faction totals became available"
       : `Entered the top 20 at #${endPoint.rank}`;
     content.push(progress);
   } else if (startPoint && !endPoint) {
     const progress = document.createElement("div");
     progress.className = "tt-change leaderboard-progress-down";
-    progress.textContent = series.movement ? "Faction averages became unavailable" : "Exited the top 20";
+    progress.textContent = series.movement ? "Faction totals became unavailable" : "Exited the top 20";
     content.push(progress);
   }
 
