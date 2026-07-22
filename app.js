@@ -1042,7 +1042,6 @@ function renderIslandTable(stats) {
           <span class="control-slider-track">
             <i class="control-slider-red" style="width:${redShare}%"></i>
             <i class="control-slider-blue" style="width:${100 - redShare}%"></i>
-            <b style="left:${redShare}%"></b>
           </span>
           <span class="control-slider-label">${controller.label}<small>${controller.share ? ` ${controller.share.toFixed(1)}%` : ""}</small></span>
         </div>

@@ -1288,18 +1288,6 @@ th[aria-sort="ascending"] .island-sort-button.is-active::after { content: "↑";
 .control-slider-red { border-radius: 999px 0 0 999px; background: var(--red); }
 .control-slider-blue { border-radius: 0 999px 999px 0; background: var(--blue); }
 
-.control-slider-track b {
-  position: absolute;
-  top: 50%;
-  width: 10px;
-  height: 10px;
-  border: 2px solid #fffdf6;
-  border-radius: 50%;
-  background: var(--ink);
-  box-shadow: 0 1px 3px rgba(43, 42, 51, 0.45);
-  transform: translate(-50%, -50%);
-}
-
 .control-slider-label {
   color: var(--ink-soft);
   font-size: 0.65rem;
