@@ -53,13 +53,12 @@ const els = {
   objectiveOverlay: $("objective-overlay"),
   regionOverlay: $("region-overlay"),
   loading: $("map-loading"),
-  zoomIn: $("zoom-in"),
-  zoomOut: $("zoom-out"),
-  zoomReset: $("zoom-reset"),
   overlayAlpha: $("overlay-alpha"),
   showCities: $("show-cities"),
   showObjectives: $("show-objectives"),
   showPerimeters: $("show-perimeters"),
+  showCityDensity: $("show-city-density"),
+  densityOverlay: $("density-overlay"),
   regionSelect: $("region-select"),
   regionIntel: $("region-intel"),
   regionStatus: $("region-status"),
@@ -68,7 +67,7 @@ const els = {
   regionBluePixels: $("region-blue-pixels"),
   regionRedCities: $("region-red-cities"),
   regionBlueCities: $("region-blue-cities"),
-  regionObjectives: $("region-objectives"),
+  regionCityDensity: $("region-city-density"),
   playBtn: $("play-btn"),
   playSpeed: $("play-speed"),
   slider: $("timeline-slider"),
@@ -86,6 +85,9 @@ const els = {
   chartTooltip: $("chart-tooltip"),
   snapshotNote: $("snapshot-note"),
   snapTbody: $("snap-tbody"),
+  islandDetails: $("island-details"),
+  islandTableNote: $("island-table-note"),
+  islandTbody: $("island-tbody"),
   leaderboardsSection: $("leaderboards"),
   leaderboardStatus: $("leaderboard-status"),
   leaderboardMetricButtons: document.querySelectorAll("[data-leaderboard-metric]"),
@@ -156,6 +158,16 @@ const state = {
     scope: null,
     stats: new Map(),
     generation: 0,
+  },
+  islandDetails: {
+    cityIslandIds: null,
+    labels: new Map(),
+    stats: null,
+    statsHash: null,
+    renderFrame: null,
+    layoutFrame: null,
+    sortKey: "area",
+    sortDirection: "desc",
   },
   renderedFronts: null,
   frontImage: null,
@@ -481,6 +493,7 @@ function drawMap() {
   drawCities(entry.cityOwners);
   drawObjectives(row.objectives, entry.fronts, row.width, row.height);
   renderRegionOutline();
+  scheduleIslandDetailsRender();
 }
 
 function buildCityMarkers() {
@@ -660,6 +673,7 @@ function updateOverlayViews() {
   const viewBox = `${-tx / scale} ${-ty / scale} ${rect.width / scale} ${rect.height / scale}`;
   els.cityOverlay.setAttribute("viewBox", viewBox);
   els.objectiveOverlay.setAttribute("viewBox", viewBox);
+  scheduleDensityLabelLayout();
 }
 
 function formatPct(value) {
@@ -744,6 +758,8 @@ function buildIslandIndex(mask) {
     let minY = MAP_H;
     let maxX = 0;
     let maxY = 0;
+    let sumX = 0;
+    let sumY = 0;
     labels[seed] = id;
     queue[tail++] = seed;
 
@@ -756,6 +772,8 @@ function buildIslandIndex(mask) {
       minY = Math.min(minY, y);
       maxX = Math.max(maxX, x);
       maxY = Math.max(maxY, y);
+      sumX += x;
+      sumY += y;
 
       if (x > 0 && labels[pixel - 1] === 0 && bit(mask, pixel - 1)) {
         labels[pixel - 1] = id;
@@ -775,8 +793,44 @@ function buildIslandIndex(mask) {
       }
     }
 
-    islands.push({ id, pixels, minX, minY, maxX, maxY });
+    islands.push({
+      id,
+      pixels,
+      minX,
+      minY,
+      maxX,
+      maxY,
+      centerX: sumX / pixels,
+      centerY: sumY / pixels,
+      anchorX: minX,
+      anchorY: minY,
+      anchorDistance: Infinity,
+      rank: 0,
+      cityIndexes: [],
+    });
   }
+
+  // Anchor badges to actual land nearest each component's centroid so labels
+  // do not float in bays or holes on irregular islands.
+  for (let pixel = 0; pixel < total; pixel += 1) {
+    const id = labels[pixel];
+    if (!id) continue;
+    const island = islands[id];
+    const x = pixel % MAP_W;
+    const y = Math.floor(pixel / MAP_W);
+    const dx = x - island.centerX;
+    const dy = y - island.centerY;
+    const distance = dx * dx + dy * dy;
+    if (distance < island.anchorDistance) {
+      island.anchorDistance = distance;
+      island.anchorX = x + 0.5;
+      island.anchorY = y + 0.5;
+    }
+  }
+
+  islands.slice(1)
+    .sort((a, b) => b.pixels - a.pixels)
+    .forEach((island, index) => { island.rank = index + 1; });
 
   state.region.labels = labels;
   state.region.islands = islands;
@@ -788,6 +842,273 @@ function islandAtMapPoint(point) {
   const x = Math.min(MAP_W - 1, Math.floor(point.x));
   const y = Math.min(MAP_H - 1, Math.floor(point.y));
   return labels[y * MAP_W + x];
+}
+
+/* ---------- Island density and landmass details ---------- */
+
+function formatIslandDensity(island) {
+  return (island.cityIndexes.length * 10000 / island.pixels).toFixed(1);
+}
+
+function buildIslandCityIndex() {
+  if (!state.region.islands || !state.cityData) return;
+  const { worldSize, cities } = state.cityData;
+  const cityIslandIds = new Uint16Array(cities.length);
+  for (const island of state.region.islands.slice(1)) island.cityIndexes = [];
+  cities.forEach(([x, y], index) => {
+    const mapX = Math.min(MAP_W - 1, Math.max(0, Math.floor(x * MAP_W / worldSize.width)));
+    const mapY = Math.min(MAP_H - 1, Math.max(0, Math.floor(y * MAP_H / worldSize.height)));
+    const islandId = state.region.labels[mapY * MAP_W + mapX];
+    cityIslandIds[index] = islandId;
+    if (islandId) state.region.islands[islandId].cityIndexes.push(index);
+  });
+  state.islandDetails.cityIslandIds = cityIslandIds;
+}
+
+function buildDensityLabels() {
+  els.densityOverlay.replaceChildren();
+  state.islandDetails.labels.clear();
+  if (!state.region.islands) return;
+  const fragment = document.createDocumentFragment();
+  const islands = state.region.islands.slice(1).sort((a, b) => a.rank - b.rank);
+  const largestCityCount = Math.max(...islands.map((island) => island.cityIndexes.length));
+  for (const island of islands) {
+    if (island.cityIndexes.length === 0) continue;
+    const cityScale = Math.sqrt(island.cityIndexes.length / largestCityCount);
+    const fontSize = 9 + cityScale * 8;
+    const label = document.createElement("div");
+    label.className = "density-label owner-unclaimed";
+    label.dataset.islandId = String(island.id);
+    label.style.setProperty("--city-label-size", `${fontSize.toFixed(1)}px`);
+    label.innerHTML = `
+      <span class="density-owner-dot"></span>
+      <span class="density-label-copy">
+        <span class="density-meta">${formatIslandDensity(island)}</span>
+        <span class="density-count">${island.cityIndexes.length.toLocaleString()} cities</span>
+      </span>
+    `;
+    label.title = `Landmass ${island.rank}: ${island.cityIndexes.length.toLocaleString()} cities; density ${formatIslandDensity(island)}`;
+    fragment.append(label);
+    state.islandDetails.labels.set(island.id, label);
+  }
+  els.densityOverlay.append(fragment);
+}
+
+function ensureIslandIndex() {
+  if (!state.mask || !state.cityData) return false;
+  if (!state.region.labels) buildIslandIndex(state.mask);
+  if (!state.islandDetails.cityIslandIds) {
+    buildIslandCityIndex();
+    buildDensityLabels();
+  }
+  return true;
+}
+
+function controllerForIsland(stats) {
+  const claimed = stats.red + stats.blue;
+  if (!claimed) return { key: "unclaimed", label: "Unclaimed", share: 0 };
+  if (stats.red === stats.blue) return { key: "mixed", label: "Contested", share: 50 };
+  const red = stats.red > stats.blue;
+  const share = (Math.max(stats.red, stats.blue) / claimed) * 100;
+  return {
+    key: red ? "red" : "blue",
+    label: red ? "Red Empire" : "Blue Republic",
+    share,
+  };
+}
+
+function computeIslandSnapshotStats() {
+  if (!state.current || !ensureIslandIndex()) return null;
+  const islands = state.region.islands;
+  const length = islands.length;
+  const redSamples = new Uint32Array(length);
+  const blueSamples = new Uint32Array(length);
+  const cityRed = new Uint16Array(length);
+  const cityBlue = new Uint16Array(length);
+  const { entry } = state.current;
+  const { width, height } = entry.canvas;
+  const rgba = entry.canvas.getContext("2d").getImageData(0, 0, width, height).data;
+  const nativeSize = width === MAP_W && height === MAP_H;
+
+  for (let pixel = 0; pixel < width * height; pixel += 1) {
+    const offset = pixel * 4;
+    if (rgba[offset + 3] === 0) continue;
+    let islandId;
+    if (nativeSize) {
+      islandId = state.region.labels[pixel];
+    } else {
+      const x = pixel % width;
+      const y = Math.floor(pixel / width);
+      const mapX = Math.min(MAP_W - 1, Math.floor((x + 0.5) * MAP_W / width));
+      const mapY = Math.min(MAP_H - 1, Math.floor((y + 0.5) * MAP_H / height));
+      islandId = state.region.labels[mapY * MAP_W + mapX];
+    }
+    if (!islandId) continue;
+    if (rgba[offset] === RED_RGB[0]) redSamples[islandId] += 1;
+    else blueSamples[islandId] += 1;
+  }
+
+  entry.cityOwners.forEach((owner, cityIndex) => {
+    const islandId = state.islandDetails.cityIslandIds[cityIndex];
+    if (!islandId) return;
+    if (owner === 1) cityRed[islandId] += 1;
+    else if (owner === 0) cityBlue[islandId] += 1;
+  });
+
+  return islands.map((island, islandId) => {
+    if (!island) return null;
+    const sampleTotal = redSamples[islandId] + blueSamples[islandId];
+    const scale = sampleTotal ? island.pixels / sampleTotal : 0;
+    return {
+      red: Math.round(redSamples[islandId] * scale),
+      blue: Math.round(blueSamples[islandId] * scale),
+      cityRed: cityRed[islandId],
+      cityBlue: cityBlue[islandId],
+    };
+  });
+}
+
+function updateDensityLabelOwnership(stats) {
+  if (!stats) return;
+  for (const island of state.region.islands.slice(1)) {
+    const label = state.islandDetails.labels.get(island.id);
+    if (!label) continue;
+    const controller = controllerForIsland(stats[island.id]);
+    label.classList.remove("owner-red", "owner-blue", "owner-mixed", "owner-unclaimed");
+    label.classList.add(`owner-${controller.key}`);
+    label.title = `Landmass ${island.rank}: ${island.cityIndexes.length.toLocaleString()} cities; density ${formatIslandDensity(island)}; ${controller.label} controls ${controller.share.toFixed(1)}%`;
+  }
+}
+
+function islandSortValue(island, value, key) {
+  if (key === "rank") return island.rank;
+  if (key === "cities") return island.cityIndexes.length;
+  if (key === "land") return value.red + value.blue;
+  if (key === "density") return island.cityIndexes.length * 10000 / island.pixels;
+  if (key === "control") return controllerForIsland(value).share;
+  return island.pixels;
+}
+
+function updateIslandSortHeaders() {
+  for (const button of document.querySelectorAll("[data-island-sort]")) {
+    const active = button.dataset.islandSort === state.islandDetails.sortKey;
+    button.classList.toggle("is-active", active);
+    button.closest("th").setAttribute(
+      "aria-sort",
+      active ? (state.islandDetails.sortDirection === "asc" ? "ascending" : "descending") : "none",
+    );
+  }
+}
+
+function formatIslandFactionSplit(red, blue) {
+  if (red > 0 && blue > 0) {
+    return `<span class="cell-red">${red.toLocaleString()}</span> / <span class="cell-blue">${blue.toLocaleString()}</span>`;
+  }
+  if (red > 0) return `<span class="cell-red">${red.toLocaleString()}</span>`;
+  if (blue > 0) return `<span class="cell-blue">${blue.toLocaleString()}</span>`;
+  return "0";
+}
+
+function renderIslandTable(stats) {
+  if (!stats || !state.current) return;
+  const fragment = document.createDocumentFragment();
+  const direction = state.islandDetails.sortDirection === "asc" ? 1 : -1;
+  const islands = state.region.islands.slice(1)
+    .filter((island) => island.cityIndexes.length > 0)
+    .sort((a, b) => {
+    const aValue = islandSortValue(a, stats[a.id], state.islandDetails.sortKey);
+    const bValue = islandSortValue(b, stats[b.id], state.islandDetails.sortKey);
+    return (aValue - bValue) * direction || a.rank - b.rank;
+    });
+  const largestLandArea = Math.max(...islands.map((island) => island.pixels));
+  for (const island of islands) {
+    const value = stats[island.id];
+    const controller = controllerForIsland(value);
+    const claimed = value.red + value.blue;
+    const redShare = claimed ? value.red / claimed * 100 : 50;
+    const landScale = Math.pow(island.pixels / largestLandArea, 0.65);
+    const controlWidth = 12 + landScale * 248;
+    const row = document.createElement("tr");
+    row.dataset.islandId = String(island.id);
+    row.tabIndex = 0;
+    row.title = `Select landmass ${island.rank} on the map`;
+    row.classList.toggle("is-current", state.region.selectedId === island.id);
+    row.innerHTML = `
+      <td class="num">${island.rank}</td>
+      <td class="num split-faction-cell">${formatIslandFactionSplit(value.cityRed, value.cityBlue)}</td>
+      <td class="num split-faction-cell">${formatIslandFactionSplit(value.red, value.blue)}</td>
+      <td>
+        <div class="control-slider owner-${controller.key}" style="--control-width:${controlWidth.toFixed(1)}px" title="${controller.label} ${controller.share.toFixed(1)}% · ${island.pixels.toLocaleString()} land px">
+          <span class="control-slider-track">
+            <i class="control-slider-red" style="width:${redShare}%"></i>
+            <i class="control-slider-blue" style="width:${100 - redShare}%"></i>
+            <b style="left:${redShare}%"></b>
+          </span>
+          <span class="control-slider-label">${controller.label}<small>${controller.share ? ` ${controller.share.toFixed(1)}%` : ""}</small></span>
+        </div>
+      </td>
+      <td class="num">${formatIslandDensity(island)} <small>/ 10k px</small></td>
+      <td class="num">${island.pixels.toLocaleString()} px</td>
+    `;
+    fragment.append(row);
+  }
+  els.islandTbody.replaceChildren(fragment);
+  updateIslandSortHeaders();
+  const captured = new Date(state.current.row.capturedAt * 1000);
+  const sortLabels = { rank: "#", cities: "cities", land: "land", control: "control", density: "density", area: "land area" };
+  const arrow = state.islandDetails.sortDirection === "asc" ? "↑" : "↓";
+  els.islandTableNote.textContent = `${islands.length.toLocaleString()} inhabited landmasses · snapshot ${state.index + 1} · ${timeFormat.format(captured)} · sorted by ${sortLabels[state.islandDetails.sortKey]} ${arrow}`;
+}
+
+function scheduleIslandDetailsRender() {
+  if (!els.showCityDensity.checked || !state.region.labels || !state.current
+      || state.islandDetails.renderFrame !== null) return;
+  state.islandDetails.renderFrame = requestAnimationFrame(() => {
+    state.islandDetails.renderFrame = null;
+    if (!state.current) return;
+    if (state.islandDetails.statsHash === state.current.row.mapHash && state.islandDetails.stats) {
+      scheduleDensityLabelLayout();
+      return;
+    }
+    const stats = computeIslandSnapshotStats();
+    if (!stats) return;
+    state.islandDetails.stats = stats;
+    state.islandDetails.statsHash = state.current.row.mapHash;
+    updateDensityLabelOwnership(stats);
+    renderIslandTable(stats);
+    scheduleDensityLabelLayout();
+  });
+}
+
+function layoutDensityLabels() {
+  state.islandDetails.layoutFrame = null;
+  const enabled = Boolean(els.showCityDensity?.checked && state.region.islands);
+  els.densityOverlay.classList.toggle("is-hidden", !enabled);
+  if (!enabled) return;
+  const { scale, tx, ty } = state.view;
+  const rect = els.viewport.getBoundingClientRect();
+  const islands = state.region.islands.slice(1).sort((a, b) => a.rank - b.rank);
+
+  for (const island of islands) {
+    const label = state.islandDetails.labels.get(island.id);
+    if (!label) continue;
+    const x = island.anchorX * scale + tx;
+    const y = island.anchorY * scale + ty;
+    label.hidden = x < 0 || x > rect.width || y < 0 || y > rect.height;
+    if (label.hidden) continue;
+    label.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
+  }
+}
+
+function scheduleDensityLabelLayout() {
+  if (state.islandDetails.layoutFrame !== null) return;
+  state.islandDetails.layoutFrame = requestAnimationFrame(layoutDensityLabels);
+}
+
+function initializeIslandFeatures() {
+  if (!ensureIslandIndex()) return;
+  scheduleIslandDetailsRender();
+  scheduleDensityLabelLayout();
 }
 
 function normalizedRegion(start, end) {
@@ -993,6 +1314,9 @@ function selectIsland(islandId) {
   commitRegionAnalytics();
   renderRegionOutline();
   updateRegionStats();
+  for (const row of els.islandTbody.querySelectorAll("tr[data-island-id]")) {
+    row.classList.toggle("is-current", Number(row.dataset.islandId) === islandId);
+  }
 }
 
 function updateRegionStats() {
@@ -1056,23 +1380,10 @@ function updateRegionStats() {
     else if (current.entry.cityOwners[index] === 0) cityBlue += 1;
   });
 
-  let objectiveRed = 0;
-  let objectiveBlue = 0;
-  if (Array.isArray(current.row.objectives)) {
-    current.row.objectives.forEach((objective, index) => {
-      if (!Array.isArray(objective)) return;
-      const [y, x] = objective;
-      const selected = island
-        ? islandAtMapPoint({ x, y }) === islandId
-        : x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
-      if (!selected) return;
-      if (index % 2 === 0) objectiveBlue += 1;
-      else objectiveRed += 1;
-    });
-  }
-
   const total = red + blue;
   const redShare = total > 0 ? (red / total) * 100 : null;
+  const landArea = island ? island.pixels : total;
+  const cityDensity = landArea > 0 ? ((cityRed + cityBlue) * 10000) / landArea : 0;
   els.regionStatus.textContent = island
     ? `${island.pixels.toLocaleString()} land px`
     : `${Math.round(bounds.right - bounds.left)} × ${Math.round(bounds.bottom - bounds.top)} px`;
@@ -1080,7 +1391,7 @@ function updateRegionStats() {
   els.regionBluePixels.textContent = redShare === null ? "0 px" : `${blue.toLocaleString()} px (${(100 - redShare).toFixed(1)}%)`;
   els.regionRedCities.textContent = cityRed.toLocaleString();
   els.regionBlueCities.textContent = cityBlue.toLocaleString();
-  els.regionObjectives.textContent = `R ${objectiveRed} · B ${objectiveBlue}`;
+  els.regionCityDensity.textContent = `${cityDensity.toFixed(1)} cities / 10k land px`;
   if (state.region.scope) {
     setRegionStat(current.row.mapHash, {
       red,
@@ -1100,6 +1411,7 @@ function clearRegion() {
   clearRegionAnalytics();
   renderRegionOutline();
   updateRegionStats();
+  for (const row of els.islandTbody.querySelectorAll("tr.is-current")) row.classList.remove("is-current");
 }
 
 const timeFormat = new Intl.DateTimeFormat(undefined, {
@@ -2770,7 +3082,12 @@ function positionLeaderboardTimelineTooltip(capturedAt) {
   const viewX = leaderboardTimelineView.xOf(capturedAt);
   const anchorX = wrap.scrollLeft + svgRect.left - wrapRect.left + (viewX / leaderboardTimelineView.width) * svgRect.width;
   const minLeft = wrap.scrollLeft + 8;
-  const maxLeft = Math.max(minLeft, wrap.scrollLeft + wrap.clientWidth - tooltip.offsetWidth - 8);
+  const visibleRight = wrap.scrollLeft + wrap.clientWidth - 8;
+  const tooltipRight = leaderboardTimelineView.tooltipRight === null
+    ? visibleRight
+    : wrap.scrollLeft + svgRect.left - wrapRect.left
+      + (leaderboardTimelineView.tooltipRight / leaderboardTimelineView.width) * svgRect.width - 8;
+  const maxLeft = Math.max(minLeft, Math.min(visibleRight, tooltipRight) - tooltip.offsetWidth);
   tooltip.style.left = `${Math.max(minLeft, Math.min(anchorX + 10, maxLeft))}px`;
 }
 
@@ -3274,6 +3591,7 @@ function renderLeaderboardTimeline() {
     height,
     plotLeft,
     plotRight,
+    tooltipRight: movementMode ? null : plotRight + 14,
     top,
     bottom,
     xOf,
@@ -3740,9 +4058,22 @@ function zoomAt(clientX, clientY, factor) {
   applyView();
 }
 
-function zoomCenter(factor) {
+function focusIsland(islandId) {
+  const island = state.region.islands?.[islandId];
+  if (!island) return;
   const rect = els.viewport.getBoundingClientRect();
-  zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  const width = Math.max(24, island.maxX - island.minX + 1);
+  const height = Math.max(24, island.maxY - island.minY + 1);
+  const padding = Math.min(rect.width, rect.height) * 0.18;
+  const scale = Math.min(
+    (rect.width - padding * 2) / width,
+    (rect.height - padding * 2) / height,
+  );
+  state.view.scale = Math.max(state.view.fit, Math.min(state.view.fit * 12, scale));
+  state.view.tx = rect.width / 2 - ((island.minX + island.maxX + 1) / 2) * state.view.scale;
+  state.view.ty = rect.height / 2 - ((island.minY + island.maxY + 1) / 2) * state.view.scale;
+  clampView();
+  applyView();
 }
 
 function setupViewport() {
@@ -3853,9 +4184,6 @@ function setupViewport() {
   els.viewport.addEventListener("dblclick", () => {
     if (!state.region.selecting) fitView();
   });
-  els.zoomIn.addEventListener("click", () => zoomCenter(1.5));
-  els.zoomOut.addEventListener("click", () => zoomCenter(1 / 1.5));
-  els.zoomReset.addEventListener("click", fitView);
 
   new ResizeObserver(() => {
     const view = state.view;
@@ -3883,16 +4211,49 @@ function setupControls() {
   els.showCities.addEventListener("change", drawMap);
   els.showObjectives.addEventListener("change", drawMap);
   els.showPerimeters.addEventListener("change", drawMap);
+  els.showCityDensity.addEventListener("change", () => {
+    els.islandDetails.hidden = !els.showCityDensity.checked;
+    if (els.showCityDensity.checked) initializeIslandFeatures();
+    scheduleDensityLabelLayout();
+  });
+  for (const button of document.querySelectorAll("[data-island-sort]")) {
+    button.addEventListener("click", () => {
+      const key = button.dataset.islandSort;
+      if (state.islandDetails.sortKey === key) {
+        state.islandDetails.sortDirection = state.islandDetails.sortDirection === "asc" ? "desc" : "asc";
+      } else {
+        state.islandDetails.sortKey = key;
+        state.islandDetails.sortDirection = key === "rank" ? "asc" : "desc";
+      }
+      renderIslandTable(state.islandDetails.stats);
+    });
+  }
   els.regionSelect.addEventListener("click", () => {
     if (state.region.selecting) {
       clearRegion();
       setRegionSelection(false);
     } else {
-      // Island labeling is a large full-map flood fill. Build it only when
-      // this optional tool is requested instead of blocking initial render.
-      if (!state.region.labels && state.mask) buildIslandIndex(state.mask);
+      ensureIslandIndex();
       setRegionSelection(true);
     }
+  });
+  els.islandTbody.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) return;
+    const row = event.target.closest("tr[data-island-id]");
+    if (!row || !ensureIslandIndex()) return;
+    const islandId = Number(row.dataset.islandId);
+    if (!state.region.islands?.[islandId]) return;
+    selectIsland(islandId);
+    setRegionSelection(true);
+    focusIsland(islandId);
+  });
+  els.islandTbody.addEventListener("keydown", (event) => {
+    if (!(["Enter", " "].includes(event.key)) || !(event.target instanceof Element)) return;
+    const row = event.target.closest("tr[data-island-id]");
+    if (!row) return;
+    event.preventDefault();
+    event.stopPropagation();
+    row.click();
   });
 
   document.addEventListener("keydown", (event) => {
@@ -4031,6 +4392,7 @@ async function init() {
     }
     els.slider.max = String(state.rows.length - 1);
     await setIndex(state.rows.length - 1);
+    if (els.showCityDensity.checked) initializeIslandFeatures();
     // Paint the current map before starting hundreds of background snapshot
     // downloads. This avoids a large startup memory spike on mobile Safari.
     const startAnalytics = () => {

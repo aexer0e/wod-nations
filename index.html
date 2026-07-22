@@ -93,11 +93,6 @@
       <section class="map-card card">
         <div class="map-toolbar">
           <div class="toolbar-group">
-            <button class="btn btn-icon" id="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
-            <button class="btn btn-icon" id="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
-            <button class="btn" id="zoom-reset" title="Fit map to view">Fit</button>
-          </div>
-          <div class="toolbar-group">
             <label class="slider-label" for="overlay-alpha">Territory</label>
             <input type="range" id="overlay-alpha" min="15" max="100" value="55" autocomplete="off" title="Territory overlay opacity" />
           </div>
@@ -112,6 +107,10 @@
           <label class="toolbar-check" title="Show each objective's distance to its nearest capturable enemy pixel">
             <input type="checkbox" id="show-perimeters" checked autocomplete="off" />
             <span>Objective perimeters</span>
+          </label>
+          <label class="toolbar-check" title="Show zoom-aware city totals and density for each landmass">
+            <input type="checkbox" id="show-city-density" autocomplete="off" />
+            <span>City density</span>
           </label>
           <div class="toolbar-group region-tools">
             <button class="btn" id="region-select" type="button" aria-pressed="false" title="Click an island or drag a rectangular region on the map">Select region</button>
@@ -133,6 +132,7 @@
             </defs>
           </svg>
           <svg class="objective-overlay" id="objective-overlay" aria-hidden="true"></svg>
+          <div class="density-overlay is-hidden" id="density-overlay" aria-hidden="true"></div>
           <section class="map-intel" id="region-intel" aria-labelledby="region-title" hidden>
             <div class="map-intel-head">
               <h2 id="region-title">Region Intel</h2>
@@ -143,7 +143,7 @@
               <div class="region-stat"><span>Blue land</span><strong class="cell-blue" id="region-blue-pixels">—</strong></div>
               <div class="region-stat"><span>Red cities</span><strong class="cell-red" id="region-red-cities">—</strong></div>
               <div class="region-stat"><span>Blue cities</span><strong class="cell-blue" id="region-blue-cities">—</strong></div>
-              <div class="region-stat region-objectives"><span>Objectives</span><strong id="region-objectives">R 0 · B 0</strong></div>
+              <div class="region-stat region-wide-stat"><span>City density</span><strong id="region-city-density">—</strong></div>
             </div>
           </section>
           <div class="map-loading" id="map-loading" hidden>
@@ -192,6 +192,32 @@
       </aside>
     </div>
 
+    <section class="card panel table-card island-table-card" id="island-details" aria-labelledby="island-table-title" hidden>
+      <div class="panel-head">
+        <div>
+          <h2 id="island-table-title">Island &amp; Landmass Details</h2>
+          <p class="panel-sub island-table-sub">Live control, cities, density, land area, and objectives for every connected clump of land.</p>
+        </div>
+        <span class="table-note" id="island-table-note" aria-live="polite">Preparing landmass index...</span>
+      </div>
+      <div class="table-scroll island-table-scroll">
+        <table class="snap-table island-table">
+          <thead>
+            <tr>
+              <th class="num" aria-sort="none"><button class="island-sort-button" type="button" data-island-sort="rank">#</button></th>
+              <th class="num" aria-sort="none" title="Cities controlled by Red and Blue"><button class="island-sort-button" type="button" data-island-sort="cities">Cities (R / B)</button></th>
+              <th class="num" aria-sort="none" title="Land controlled by Red and Blue"><button class="island-sort-button" type="button" data-island-sort="land">Land (R / B)</button></th>
+              <th aria-sort="none"><button class="island-sort-button" type="button" data-island-sort="control">Control</button></th>
+              <th class="num" aria-sort="none" title="Total cities per 10,000 playable land pixels"><button class="island-sort-button" type="button" data-island-sort="density">City density</button></th>
+              <th class="num" aria-sort="descending"><button class="island-sort-button is-active" type="button" data-island-sort="area">Land area</button></th>
+            </tr>
+          </thead>
+          <tbody id="island-tbody">
+            <tr class="table-empty"><td colspan="6">Loading landmass details...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
       <section class="card panel table-card">
         <div class="panel-head">

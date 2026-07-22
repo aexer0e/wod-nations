@@ -542,6 +542,67 @@ input[type="range"]::-moz-range-thumb {
   pointer-events: none;
 }
 
+.density-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.density-overlay.is-hidden { display: none; }
+
+.density-label {
+  --owner-color: #77716a;
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 3px;
+  color: #fff;
+  font-family: Arial, sans-serif;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  white-space: nowrap;
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.95),
+    0 0 4px rgba(0, 0, 0, 0.8),
+    0 0 7px rgba(0, 0, 0, 0.55);
+  filter: drop-shadow(0 1px 1px rgba(255, 255, 255, 0.24));
+  will-change: transform;
+}
+
+.density-label[hidden] { display: none; }
+.density-label.owner-red { --owner-color: var(--red-deep); }
+.density-label.owner-blue { --owner-color: var(--blue-deep); }
+.density-label.owner-mixed { --owner-color: var(--gold); }
+
+.density-owner-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--owner-color);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.9);
+}
+
+.density-count {
+  display: block;
+  margin-top: 1px;
+  font-size: max(7px, calc(var(--city-label-size, 10px) * 0.58));
+  font-weight: 800;
+}
+
+.density-label-copy { display: block; }
+
+.density-meta {
+  display: block;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: var(--city-label-size, 10px);
+  font-weight: 700;
+}
+
 .region-overlay {
   position: absolute;
   inset: 0;
@@ -1162,6 +1223,96 @@ input[type="range"]::-moz-range-thumb {
 .cell-flat { color: var(--ink-soft); }
 .split-faction-cell { white-space: nowrap; }
 
+/* Island / connected-landmass details */
+
+.island-table-card { margin-top: 0; }
+.island-table-card[hidden] { display: none; }
+.island-table-card .panel-head { align-items: flex-end; }
+.island-table-sub { margin: 4px 0 0; }
+.island-table-scroll { max-height: 460px; }
+.island-table { min-width: 850px; }
+.island-table tbody tr { cursor: pointer; }
+.island-table tbody tr:focus-visible {
+  outline: 3px solid var(--gold);
+  outline-offset: -3px;
+}
+.island-table td small { color: var(--ink-soft); font-size: 0.7rem; }
+
+.island-sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.island-sort-button:hover,
+.island-sort-button:focus-visible,
+.island-sort-button.is-active { color: var(--ink); }
+
+.island-sort-button.is-active::after {
+  content: "↓";
+  color: #9b6508;
+  font-size: 0.78rem;
+}
+
+th[aria-sort="ascending"] .island-sort-button.is-active::after { content: "↑"; }
+
+.control-slider {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  width: var(--control-width, 150px);
+  vertical-align: middle;
+}
+
+.control-slider-track {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 7px;
+  overflow: visible;
+  border: 1px solid rgba(43, 42, 51, 0.62);
+  border-radius: 999px;
+  background: #ddd6c4;
+}
+
+.control-slider-red,
+.control-slider-blue { display: block; height: 100%; }
+.control-slider-red { border-radius: 999px 0 0 999px; background: var(--red); }
+.control-slider-blue { border-radius: 0 999px 999px 0; background: var(--blue); }
+
+.control-slider-track b {
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  border: 2px solid #fffdf6;
+  border-radius: 50%;
+  background: var(--ink);
+  box-shadow: 0 1px 3px rgba(43, 42, 51, 0.45);
+  transform: translate(-50%, -50%);
+}
+
+.control-slider-label {
+  color: var(--ink-soft);
+  font-size: 0.65rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.control-slider.owner-red .control-slider-label { color: var(--red-deep); }
+.control-slider.owner-blue .control-slider-label { color: var(--blue-deep); }
+.control-slider.owner-mixed .control-slider-label { color: #795006; }
+.control-slider-label small { color: currentColor !important; opacity: 0.72; }
+.table-empty td { padding: 24px; text-align: center !important; color: var(--ink-soft); }
+
 /* Regional fight inspector */
 
 .region-status {
@@ -1193,7 +1344,7 @@ input[type="range"]::-moz-range-thumb {
 }
 
 .region-stat:nth-child(even) { border-right: 0; }
-.region-objectives { grid-column: 1 / -1; border-right: 0; border-bottom: 0; }
+.region-wide-stat { grid-column: 1 / -1; border-right: 0; border-bottom: 0; }
 
 .region-stat span {
   display: block;
