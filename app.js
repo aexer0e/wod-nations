@@ -18,6 +18,7 @@ const OWNERSHIP_CACHE_LIMIT = MEMORY_CONSTRAINED ? 2 : 12;
 const PREFETCH_COUNT = MEMORY_CONSTRAINED ? 0 : 3;
 const EMPTY_FRONTS = new Uint32Array(0);
 const POLL_MS = 5 * 60 * 1000;
+const SNAPSHOT_GAP_THRESHOLD_SECONDS = 40 * 60;
 const SESSION_KEY = "wod-nations-access-session";
 
 if (IS_IOS) document.documentElement.classList.add("ios");
@@ -1279,7 +1280,7 @@ function buildRegionScope() {
 
 function updateAnalyticsScopeCopy() {
   const regional = Boolean(state.region.scope);
-  const baseNote = "Newest first · Δ columns compare with the previous snapshot · click a row to view it";
+  const baseNote = "Newest first · Δ columns compare with the previous snapshot · amber underlined time = gap over 40 min · click a row to view it";
   els.snapshotNote.textContent = regional ? `Selected region only · ${baseNote}` : baseNote;
   const description = state.chartMode === "movement"
     ? "Movement zooms in on faction advantage across the available polls: up is Blue, down is Red. Solid is land/pixels; dotted is cities."
@@ -1930,6 +1931,14 @@ function formatChartSpan(seconds) {
   }
   if (hours >= 1) return `${Math.round(hours)} h`;
   return `${Math.max(1, Math.round(seconds / 60))} min`;
+}
+
+function formatSnapshotGap(seconds) {
+  const totalMinutes = Math.max(1, Math.round(seconds / 60));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours === 0) return `${minutes} min`;
+  return minutes === 0 ? `${hours} h` : `${hours} h ${minutes} min`;
 }
 
 function rowsForTimeRange(rows, range, timeOf) {
@@ -2677,6 +2686,7 @@ function addCell(tr, className, text) {
   if (className) td.className = className;
   td.textContent = text;
   tr.append(td);
+  return td;
 }
 
 function factionCell(tr, value, formatted) {
@@ -2722,7 +2732,21 @@ function renderTable() {
     if (i === state.index) tr.classList.add("is-current");
 
     addCell(tr, "num cell-flat", `#${row.id}`);
-    addCell(tr, "", timeFormat.format(new Date(row.capturedAt * 1000)));
+    const capturedText = timeFormat.format(new Date(row.capturedAt * 1000));
+    const capturedCell = addCell(tr, "", capturedText);
+    if (i > 0) {
+      const gapSeconds = row.capturedAt - rows[i - 1].capturedAt;
+      if (gapSeconds > SNAPSHOT_GAP_THRESHOLD_SECONDS) {
+        const gapText = formatSnapshotGap(gapSeconds);
+        tr.classList.add("has-snapshot-gap");
+        capturedCell.classList.add("snapshot-gap-time");
+        capturedCell.title = `${gapText} since the previous snapshot — Progress includes the full gap`;
+        capturedCell.setAttribute(
+          "aria-label",
+          `${capturedText}, captured ${gapText} after the previous snapshot`,
+        );
+      }
+    }
     splitFactionCell(
       tr,
       share,

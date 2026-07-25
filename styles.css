@@ -1218,6 +1218,28 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: inset 3px 0 0 var(--gold);
 }
 
+.snap-table tbody tr.has-snapshot-gap {
+  background: linear-gradient(90deg, rgba(240, 169, 46, 0.12), rgba(240, 169, 46, 0.025) 52%, transparent);
+}
+
+.snap-table tbody tr.has-snapshot-gap:hover {
+  background: linear-gradient(90deg, rgba(240, 169, 46, 0.2), rgba(240, 169, 46, 0.07) 58%, #fbf5e3);
+}
+
+.snap-table tbody tr.has-snapshot-gap.is-current {
+  background: linear-gradient(90deg, rgba(240, 169, 46, 0.25), rgba(240, 169, 46, 0.12) 58%, rgba(240, 169, 46, 0.05));
+}
+
+.snapshot-gap-time {
+  color: #875400;
+  font-weight: 800;
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-color: var(--gold);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
 .cell-red { color: var(--red-deep); font-weight: 700; }
 .cell-blue { color: var(--blue-deep); font-weight: 700; }
 .cell-flat { color: var(--ink-soft); }
