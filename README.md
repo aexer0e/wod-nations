@@ -17,6 +17,8 @@ The site starts behind an access-code screen. The code is verified only by the W
 
 Both snapshot encodings are supported: `playable-bitset-zlib-v1` (compact) and the legacy `raw-u8-zlib-v1`. Decoded overlays are cached in memory by `mapHash`.
 
+The full retained timeline and its precomputed land/city graph totals are cached in IndexedDB. On later visits the frontend requests only the newest overlap, while ownership map blobs are downloaded only for snapshots that are actually displayed.
+
 ## Run locally
 
 Any static file server works (the map decode uses `fetch`, so opening `index.html` from disk will not):
