@@ -13,13 +13,15 @@ const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
   || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const MEMORY_CONSTRAINED = IS_IOS
   || (Number.isFinite(navigator.deviceMemory) && navigator.deviceMemory <= 4);
-const CACHE_LIMIT = MEMORY_CONSTRAINED ? 1 : 8; // each decoded 1920x1080 canvas is about 8 MiB
+const CACHE_LIMIT = MEMORY_CONSTRAINED ? 2 : 10; // each decoded 1920x1080 canvas is about 8 MiB
 const OWNERSHIP_CACHE_LIMIT = MEMORY_CONSTRAINED ? 2 : 12;
-const PREFETCH_COUNT = MEMORY_CONSTRAINED ? 0 : 3;
 const EMPTY_FRONTS = new Uint32Array(0);
 const POLL_MS = 5 * 60 * 1000;
 const SNAPSHOT_GAP_THRESHOLD_SECONDS = 40 * 60;
 const SESSION_KEY = "wod-nations-access-session";
+const HISTORY_DB_NAME = "wod-nations-history";
+const HISTORY_DB_VERSION = 1;
+const HISTORY_STORE = "snapshots";
 
 if (IS_IOS) document.documentElement.classList.add("ios");
 if (MEMORY_CONSTRAINED) document.documentElement.classList.add("memory-constrained");
@@ -110,6 +112,8 @@ const state = {
   index: -1,
   playing: false,
   playTimer: null,
+  playbackGeneration: 0,
+  playbackNextAt: 0,
   renderToken: 0,
   activeRender: null,
   queuedRender: null,
@@ -230,6 +234,89 @@ async function fetchJSON(url) {
     throw new Error(body?.error || `HTTP ${resp.status} for ${url}`);
   }
   return resp.json();
+}
+
+let historyDatabasePromise = null;
+
+function openHistoryDatabase() {
+  if (!("indexedDB" in window)) return Promise.reject(new Error("IndexedDB is unavailable."));
+  if (historyDatabasePromise) return historyDatabasePromise;
+  historyDatabasePromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(HISTORY_DB_NAME, HISTORY_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(HISTORY_STORE)) {
+        database.createObjectStore(HISTORY_STORE, { keyPath: "capturedAt" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Could not open the history cache."));
+  });
+  return historyDatabasePromise;
+}
+
+function historyTransactionDone(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("History cache transaction failed."));
+    transaction.onabort = () => reject(transaction.error || new Error("History cache transaction was aborted."));
+  });
+}
+
+async function readCachedTimelineRows() {
+  const database = await openHistoryDatabase();
+  const transaction = database.transaction(HISTORY_STORE, "readonly");
+  const request = transaction.objectStore(HISTORY_STORE).getAll();
+  const rows = await new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error || new Error("Could not read the history cache."));
+  });
+  return rows
+    .filter((row) => Number.isFinite(row?.capturedAt) && Number.isFinite(row?.id))
+    .sort((a, b) => a.capturedAt - b.capturedAt);
+}
+
+async function cacheTimelineRows(rows, oldestCapturedAt = null) {
+  const database = await openHistoryDatabase();
+  const transaction = database.transaction(HISTORY_STORE, "readwrite");
+  const store = transaction.objectStore(HISTORY_STORE);
+  for (const row of rows) store.put(row);
+  if (Number.isFinite(oldestCapturedAt)) {
+    const range = IDBKeyRange.upperBound(oldestCapturedAt, true);
+    store.delete(range);
+  }
+  await historyTransactionDone(transaction);
+}
+
+async function loadTimelineSummary() {
+  let cached = [];
+  try {
+    cached = await readCachedTimelineRows();
+  } catch {
+    /* IndexedDB may be unavailable in private browsing; the network remains authoritative. */
+  }
+  const after = cached.at(-1)?.capturedAt;
+  const suffix = Number.isFinite(after) ? `?after=${after}` : "";
+  try {
+    const summary = await fetchJSON(`${API}/v1/timeline/summary${suffix}`);
+    const merged = new Map(cached.map((row) => [row.capturedAt, row]));
+    for (const row of summary.rows || []) merged.set(row.capturedAt, row);
+    const rows = [...merged.values()]
+      .filter((row) => (!Number.isFinite(summary.oldestCapturedAt) || row.capturedAt >= summary.oldestCapturedAt)
+        && (!Number.isFinite(summary.latestCapturedAt) || row.capturedAt <= summary.latestCapturedAt))
+      .sort((a, b) => a.capturedAt - b.capturedAt);
+    void cacheTimelineRows(summary.rows || [], summary.oldestCapturedAt).catch(() => {});
+    return { rows, oldestCapturedAt: summary.oldestCapturedAt, latestCapturedAt: summary.latestCapturedAt };
+  } catch (error) {
+    if (cached.length > 0) {
+      return {
+        rows: cached,
+        oldestCapturedAt: cached[0].capturedAt,
+        latestCapturedAt: cached.at(-1).capturedAt,
+      };
+    }
+    throw error;
+  }
 }
 
 async function inflate(resp) {
@@ -1489,32 +1576,66 @@ function setIndex(rawIndex) {
 }
 
 function prefetch(fromIndex, count) {
+  const pending = [];
   for (let i = fromIndex; i < Math.min(fromIndex + count, state.rows.length); i += 1) {
-    getDecoded(state.rows[i]).catch(() => {});
+    pending.push(getDecoded(state.rows[i]));
   }
+  return Promise.allSettled(pending);
+}
+
+function playbackBufferSize() {
+  const interval = Number(els.playSpeed.value);
+  const requested = interval <= 120 ? 9 : interval <= 240 ? 7 : interval <= 500 ? 5 : 3;
+  return Math.max(1, Math.min(requested, CACHE_LIMIT - 1));
+}
+
+function playbackWarmupSize() {
+  const interval = Number(els.playSpeed.value);
+  const requested = interval <= 120 ? 4 : interval <= 240 ? 3 : interval <= 500 ? 2 : 1;
+  return Math.min(requested, playbackBufferSize());
 }
 
 /* ---------- Timeline playback ---------- */
 
 function setPlaying(playing) {
   state.playing = playing;
+  const generation = ++state.playbackGeneration;
   els.playBtn.textContent = playing ? "⏸" : "▶";
   els.playBtn.title = playing ? "Pause (Space)" : "Play timeline (Space)";
   clearTimeout(state.playTimer);
-  if (playing) playbackTick();
+  if (playing) void startPlayback(generation);
 }
 
-async function playbackTick() {
-  if (!state.playing) return;
+async function startPlayback(generation) {
   const next = state.index + 1;
   if (next >= state.rows.length) {
     setPlaying(false);
     return;
   }
+  const warmupSize = playbackWarmupSize();
+  await prefetch(next, warmupSize);
+  if (!state.playing || generation !== state.playbackGeneration) return;
+  state.playbackNextAt = performance.now();
+  void prefetch(next + warmupSize, playbackBufferSize() - warmupSize);
+  void playbackTick(generation);
+}
+
+async function playbackTick(generation) {
+  if (!state.playing || generation !== state.playbackGeneration) return;
+  const interval = Number(els.playSpeed.value);
+  const lag = Math.max(0, performance.now() - state.playbackNextAt);
+  const skippedFrames = Math.floor(lag / interval);
+  const next = state.index + 1 + skippedFrames;
+  if (next >= state.rows.length) {
+    setPlaying(false);
+    return;
+  }
+  state.playbackNextAt += (skippedFrames + 1) * interval;
   const rendered = await setIndex(next);
-  if (!rendered || !state.playing) return;
-  prefetch(next + 1, PREFETCH_COUNT);
-  state.playTimer = setTimeout(playbackTick, Number(els.playSpeed.value));
+  if (!rendered || !state.playing || generation !== state.playbackGeneration) return;
+  void prefetch(next + 1, playbackBufferSize());
+  const delay = Math.max(0, state.playbackNextAt - performance.now());
+  state.playTimer = setTimeout(() => playbackTick(generation), delay);
 }
 
 function togglePlay() {
@@ -1573,6 +1694,8 @@ async function refreshLive() {
     if (lastRow && latest.id !== lastRow.id && latest.capturedAt > lastRow.capturedAt) {
       const wasAtEnd = state.index === state.rows.length - 1;
       state.rows.push(latest);
+      seedPrecomputedStats([latest]);
+      void cacheTimelineRows([latest]).catch(() => {});
       els.slider.max = String(state.rows.length - 1);
       queueStats([latest]);
       queueRegionStats([latest]);
@@ -1644,6 +1767,24 @@ function loadPersistedStats() {
       }
     }
   } catch { /* corrupt or unavailable storage — recompute from the API */ }
+}
+
+function seedPrecomputedStats(rows) {
+  let changed = false;
+  for (const row of rows) {
+    if (!Number.isFinite(row.redPixels)
+        || !Number.isFinite(row.bluePixels)
+        || !Number.isFinite(row.redCities)
+        || !Number.isFinite(row.blueCities)) continue;
+    state.stats.set(row.mapHash, {
+      red: row.redPixels,
+      blue: row.bluePixels,
+      cityRed: row.redCities,
+      cityBlue: row.blueCities,
+    });
+    changed = true;
+  }
+  if (changed) persistStats();
 }
 
 function persistStats() {
@@ -4226,6 +4367,9 @@ function setupControls() {
     setIndex(Number(els.slider.value));
   });
   els.playBtn.addEventListener("click", togglePlay);
+  els.playSpeed.addEventListener("change", () => {
+    if (state.playing) setPlaying(true);
+  });
   els.loadOlder.addEventListener("click", loadOlder);
   els.overlayAlpha.addEventListener("input", () => {
     state.overlayAlpha = Number(els.overlayAlpha.value) / 100;
@@ -4391,7 +4535,7 @@ async function init() {
       loadTerrain(),
       (async () => inflate(await fetch(MASK_URL)))(),
       fetchJSON(CITY_DATA_URL),
-      fetchJSON(`${API}/v1/timeline?limit=336`),
+      loadTimelineSummary(),
       fetchJSON(`${API}/v1/snapshots/latest`),
       fetchJSON(`${API}/health`),
     ]);
@@ -4402,13 +4546,15 @@ async function init() {
     if (state.region.selectedId || state.region.bounds) commitRegionAnalytics();
     state.health = health;
     renderStatus();
-    state.rows = timeline.rows.slice().reverse();
+    state.rows = timeline.rows;
     if (!state.rows.some((row) => row.id === latest.id)) {
       state.rows.push(latest);
       state.rows.sort((a, b) => a.capturedAt - b.capturedAt);
+      void cacheTimelineRows([latest]).catch(() => {});
     }
-    state.nextBefore = timeline.nextBefore;
-    els.loadOlder.hidden = !state.nextBefore;
+    seedPrecomputedStats(state.rows);
+    state.nextBefore = null;
+    els.loadOlder.hidden = true;
     if (state.rows.length === 0) {
       showError("No snapshots have been captured yet. Check back soon!");
       return;
@@ -4416,8 +4562,8 @@ async function init() {
     els.slider.max = String(state.rows.length - 1);
     await setIndex(state.rows.length - 1);
     if (els.showCityDensity.checked) initializeIslandFeatures();
-    // Paint the current map before starting hundreds of background snapshot
-    // downloads. This avoids a large startup memory spike on mobile Safari.
+    // Paint the current map before filling charts. Rows with server-computed
+    // totals need no map download; the queue only handles legacy fallback rows.
     const startAnalytics = () => {
       analyticsReady = true;
       queueStats(state.rows);
@@ -4426,7 +4572,6 @@ async function init() {
     };
     if (MEMORY_CONSTRAINED) setTimeout(startAnalytics, 1500);
     else startAnalytics();
-    prefetch(Math.max(0, state.rows.length - PREFETCH_COUNT - 1), PREFETCH_COUNT);
   } catch (error) {
     showError(`Could not reach the map service: ${error.message}`);
     return;
