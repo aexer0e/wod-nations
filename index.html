@@ -92,10 +92,6 @@
       <!-- Map -->
       <section class="map-card card">
         <div class="map-toolbar">
-          <div class="toolbar-group">
-            <label class="slider-label" for="overlay-alpha">Territory</label>
-            <input type="range" id="overlay-alpha" min="15" max="100" value="55" autocomplete="off" title="Territory overlay opacity" />
-          </div>
           <label class="toolbar-check">
             <input type="checkbox" id="show-cities" checked autocomplete="off" />
             <span>Cities</span>
@@ -113,6 +109,7 @@
             <span>City density</span>
           </label>
           <div class="toolbar-group region-tools">
+            <button class="btn simulation-toggle" id="simulation-toggle" type="button" aria-pressed="false" disabled>Enable simulation</button>
             <button class="btn" id="region-select" type="button" aria-pressed="false" title="Click an island or drag a rectangular region on the map">Select region</button>
           </div>
         </div>
@@ -132,6 +129,7 @@
             </defs>
           </svg>
           <svg class="objective-overlay" id="objective-overlay" aria-hidden="true"></svg>
+          <svg class="simulation-markers" id="simulation-markers" aria-label="Objective forecast markers"></svg>
           <div class="density-overlay is-hidden" id="density-overlay" aria-hidden="true"></div>
           <section class="map-intel" id="region-intel" aria-labelledby="region-title" hidden>
             <div class="map-intel-head">
@@ -164,8 +162,27 @@
           <div class="timeline-meta">
             <span id="timeline-label">—</span>
             <span class="timeline-pos" id="timeline-pos"></span>
+            <span class="timeline-city-change" id="timeline-city-change" hidden></span>
           </div>
           <button class="btn" id="load-older" hidden title="Fetch older snapshots">⏪ Older</button>
+          <div class="gain-control" id="simulation-controls" hidden>
+            <svg class="simulation-city-timeline" id="simulation-city-timeline" viewBox="0 0 1000 44" preserveAspectRatio="none" role="img" aria-label="Simulated city gains and losses over 48 hours">
+              <line class="simulation-city-zero" x1="0" y1="22" x2="1000" y2="22"></line>
+              <path class="simulation-city-line red" id="simulation-city-red-line"></path>
+              <path class="simulation-city-line blue" id="simulation-city-blue-line"></path>
+              <line class="simulation-city-cursor" id="simulation-city-cursor" x1="0" y1="2" x2="0" y2="42"></line>
+            </svg>
+            <div class="gain-readout">
+              <span class="gain-side gain-side-red">Red <output id="red-gain-output">200</output></span>
+              <span class="gain-balance" id="gain-balance-output">Even pressure · 0</span>
+              <span class="gain-side gain-side-blue">Blue <output id="blue-gain-output">200</output></span>
+            </div>
+            <input type="range" id="gain-slider" min="-1000" max="1000" value="0" step="1" autocomplete="off" aria-label="Projected Red and Blue pixel gains every 30 minutes" />
+            <div class="gain-foot">
+              <span class="gain-unit">pixels gained per side every 30 min · logarithmic</span>
+              <span class="simulation-status" id="simulation-status" role="status">Waiting to simulate…</span>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -187,7 +204,7 @@
             <li><span class="swatch swatch-fighting swatch-fighting-blue"></span> Blue objective attack front</li>
             <li><span class="swatch swatch-terrain"></span> Terrain</li>
           </ul>
-          <p class="hint">Scroll to zoom, drag to pan. With Select region active, click an island or drag a box. Use the arrow keys to step through time and the space key to play.</p>
+          <p class="hint">Press Enable simulation, then drag either objective star. Equal pressure deadlocks when both objectives meet on one front, but both sides can advance on separate fronts.</p>
         </section>
       </aside>
     </div>
@@ -298,9 +315,17 @@
             <h2 id="leaderboard-graph-title">Rankings</h2>
             <p class="panel-sub" id="leaderboard-graph-description">Comparing the current top-20 World standings.</p>
           </div>
-          <div class="leaderboard-view-toggle" role="group" aria-label="Leaderboard metric">
-            <button type="button" class="leaderboard-view-option is-active" data-leaderboard-metric="world" aria-pressed="true">World</button>
-            <button type="button" class="leaderboard-view-option" data-leaderboard-metric="elo" aria-pressed="false">ELO</button>
+          <div class="leaderboard-graph-controls">
+            <label class="leaderboard-limit-slider" for="leaderboard-limit">
+              <span>Players</span>
+              <output id="leaderboard-limit-output" for="leaderboard-limit">Top 20</output>
+              <input id="leaderboard-limit" type="range" min="10" max="100" step="10" value="20" aria-label="Players shown" aria-valuetext="Top 20">
+              <span class="leaderboard-limit-bounds" aria-hidden="true"><span>10</span><span>100</span></span>
+            </label>
+            <div class="leaderboard-view-toggle" role="group" aria-label="Leaderboard metric">
+              <button type="button" class="leaderboard-view-option is-active" data-leaderboard-metric="world" aria-pressed="true">World</button>
+              <button type="button" class="leaderboard-view-option" data-leaderboard-metric="elo" aria-pressed="false">ELO</button>
+            </div>
           </div>
         </div>
         <div class="leaderboard-graph-wrap" id="leaderboard-graph-wrap">
@@ -331,9 +356,12 @@
             </div>
           </div>
         </div>
-        <div class="leaderboard-timeline-wrap" id="leaderboard-timeline-wrap">
-          <svg id="leaderboard-timeline" role="group" aria-label="Top 20 World value history"></svg>
-          <div class="chart-tooltip leaderboard-timeline-tooltip" id="leaderboard-timeline-tooltip" hidden></div>
+        <div class="leaderboard-timeline-body">
+          <aside class="leaderboard-timeline-roster" id="leaderboard-timeline-roster" aria-label="Current leaderboard players"></aside>
+          <div class="leaderboard-timeline-wrap" id="leaderboard-timeline-wrap">
+            <svg id="leaderboard-timeline" role="group" aria-label="Top 20 World value history"></svg>
+            <div class="chart-tooltip leaderboard-timeline-tooltip" id="leaderboard-timeline-tooltip" hidden></div>
+          </div>
         </div>
       </section>
     </section>
@@ -343,6 +371,7 @@
     <p>Fan-made live map for the <strong>War of Dots</strong> Nations event · a new snapshot is captured every 30 minutes.</p>
   </footer>
 
+  <script src="objective-simulator.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

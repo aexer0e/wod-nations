@@ -54,13 +54,16 @@ const els = {
   battleCanvas: $("battle-overlay"),
   cityOverlay: $("city-overlay"),
   objectiveOverlay: $("objective-overlay"),
+  simulationMarkers: $("simulation-markers"),
   regionOverlay: $("region-overlay"),
   loading: $("map-loading"),
-  overlayAlpha: $("overlay-alpha"),
   showCities: $("show-cities"),
   showObjectives: $("show-objectives"),
   showPerimeters: $("show-perimeters"),
   showCityDensity: $("show-city-density"),
+  simulationToggle: $("simulation-toggle"),
+  simulationControls: $("simulation-controls"),
+  simulationStatus: $("simulation-status"),
   densityOverlay: $("density-overlay"),
   regionSelect: $("region-select"),
   regionIntel: $("region-intel"),
@@ -76,7 +79,16 @@ const els = {
   slider: $("timeline-slider"),
   timelineLabel: $("timeline-label"),
   timelinePos: $("timeline-pos"),
+  timelineCityChange: $("timeline-city-change"),
+  simulationCityTimeline: $("simulation-city-timeline"),
+  simulationCityRedLine: $("simulation-city-red-line"),
+  simulationCityBlueLine: $("simulation-city-blue-line"),
+  simulationCityCursor: $("simulation-city-cursor"),
   loadOlder: $("load-older"),
+  gainSlider: $("gain-slider"),
+  gainBalanceOutput: $("gain-balance-output"),
+  redGainOutput: $("red-gain-output"),
+  blueGainOutput: $("blue-gain-output"),
   newsText: $("news-text"),
   chartStatus: $("chart-status"),
   chartDescription: $("chart-description"),
@@ -94,6 +106,8 @@ const els = {
   leaderboardsSection: $("leaderboards"),
   leaderboardStatus: $("leaderboard-status"),
   leaderboardMetricButtons: document.querySelectorAll("[data-leaderboard-metric]"),
+  leaderboardLimitSlider: $("leaderboard-limit"),
+  leaderboardLimitOutput: $("leaderboard-limit-output"),
   leaderboardGraphDescription: $("leaderboard-graph-description"),
   leaderboardGraphWrap: $("leaderboard-graph-wrap"),
   leaderboardGraph: $("leaderboard-graph"),
@@ -101,6 +115,7 @@ const els = {
   leaderboardTimelineStatus: $("leaderboard-timeline-status"),
   leaderboardTimelineViewButtons: document.querySelectorAll("[data-leaderboard-timeline-view]"),
   leaderboardTimelineRangeButtons: document.querySelectorAll("[data-leaderboard-timeline-range]"),
+  leaderboardTimelineRoster: $("leaderboard-timeline-roster"),
   leaderboardTimelineWrap: $("leaderboard-timeline-wrap"),
   leaderboardTimeline: $("leaderboard-timeline"),
   leaderboardTimelineTooltip: $("leaderboard-timeline-tooltip"),
@@ -141,6 +156,7 @@ const state = {
     historyFetchedAt: null,
     historyError: null,
     metric: "world",
+    displayLimit: 20,
     highlightedPlayer: null,
     timelineView: "players",
     timelineRange: "all",
@@ -177,6 +193,27 @@ const state = {
   renderedFronts: null,
   frontImage: null,
   frontGlowScale: null,
+  simulation: {
+    active: false,
+    phase: "off",
+    ready: false,
+    steps: 96,
+    balance: 0,
+    gains: { red: 200, blue: 200 },
+    objectives: [null, null],
+    customized: [false, false],
+    frames: [],
+    grid: null,
+    gridHash: null,
+    baseRgba: null,
+    snapshotCanvas: null,
+    base: null,
+    frameIndex: 0,
+    debounceTimer: null,
+    requestId: 0,
+    worker: null,
+    dragging: null,
+  },
 };
 
 /* ---------- Fetch and decode helpers ---------- */
@@ -582,6 +619,7 @@ function drawMap() {
   drawObjectives(row.objectives, entry.fronts, row.width, row.height);
   renderRegionOutline();
   scheduleIslandDetailsRender();
+  renderSimulationMarkers();
 }
 
 function buildCityMarkers() {
@@ -692,8 +730,9 @@ function drawObjectives(objectives, fronts, width, height) {
     clearObjectiveGraphics();
     return;
   }
-  const showMarkers = els.showObjectives.checked;
-  const showPerimeters = els.showPerimeters.checked;
+  const simulationVisible = state.simulation.active;
+  const showMarkers = els.showObjectives.checked && !simulationVisible;
+  const showPerimeters = els.showPerimeters.checked && !simulationVisible;
   if (!showMarkers && !showPerimeters) {
     clearObjectiveGraphics();
     return;
@@ -754,6 +793,497 @@ function starPath(x, y, radius) {
   return `M${points.join("L")}Z`;
 }
 
+/* ---------- Simulation mode ---------- */
+
+function liveObjectiveFor(row, faction) {
+  const objective = Array.isArray(row?.objectives) ? row.objectives[faction === 1 ? 1 : 0] : null;
+  if (!Array.isArray(objective) || !Number.isFinite(objective[0]) || !Number.isFinite(objective[1])) {
+    return { x: MAP_W / 2, y: MAP_H / 2 };
+  }
+  return {
+    x: Math.max(0, Math.min(MAP_W, objective[1])),
+    y: Math.max(0, Math.min(MAP_H, objective[0])),
+  };
+}
+
+function ensureSimulationObjectives(row) {
+  for (const faction of [0, 1]) {
+    if (!state.simulation.objectives[faction] || !state.simulation.customized[faction]) {
+      state.simulation.objectives[faction] = liveObjectiveFor(row, faction);
+    }
+  }
+}
+
+function simulationCityCoordinates() {
+  const { worldSize, cities } = state.cityData;
+  return cities.map(([x, y]) => [
+    (x * MAP_W) / worldSize.width,
+    (y * MAP_H) / worldSize.height,
+  ]);
+}
+
+function buildSimulationGrid(row, entry) {
+  if (state.simulation.gridHash === row.mapHash && state.simulation.grid) return state.simulation.grid;
+  ensureIslandIndex();
+  const rgba = entry.canvas.getContext("2d", { willReadFrequently: true })
+    .getImageData(0, 0, row.width, row.height).data;
+  state.simulation.baseRgba = rgba;
+  state.simulation.grid = ObjectiveSimulator.buildGrid({
+    rgba,
+    width: row.width,
+    height: row.height,
+    step: 1,
+    mapWidth: MAP_W,
+    mapHeight: MAP_H,
+    cities: simulationCityCoordinates(),
+    cityOwners: entry.cityOwners,
+    islandIds: state.region.labels,
+  });
+  state.simulation.gridHash = row.mapHash;
+  return state.simulation.grid;
+}
+
+function currentTimelineIndex() {
+  return state.simulation.active ? state.simulation.frameIndex : state.index;
+}
+
+function timelineLastIndex() {
+  return state.simulation.active ? state.simulation.steps : Math.max(0, state.rows.length - 1);
+}
+
+function updateTimelineRange() {
+  els.slider.max = String(timelineLastIndex());
+  els.slider.value = String(currentTimelineIndex());
+  els.slider.classList.toggle("is-simulation", state.simulation.active);
+}
+
+function updateGainReadout() {
+  const gains = ObjectiveSimulator.logarithmicGainRates(state.simulation.balance);
+  state.simulation.gains = gains;
+  els.redGainOutput.textContent = gains.red.toLocaleString();
+  els.blueGainOutput.textContent = gains.blue.toLocaleString();
+  const balance = state.simulation.balance;
+  els.gainBalanceOutput.textContent = balance === 0
+    ? "Even pressure · 0"
+    : `${balance < 0 ? "Red" : "Blue"} pressure · ${Math.abs(balance).toLocaleString()}`;
+}
+
+function setSimulationPhase(phase, message) {
+  state.simulation.phase = phase;
+  state.simulation.ready = phase === "ready";
+  const busy = phase === "waiting" || phase === "computing";
+  els.playBtn.disabled = busy;
+  els.playSpeed.disabled = busy;
+  els.slider.disabled = busy;
+  els.simulationToggle.classList.toggle("is-computing", busy);
+  els.simulationStatus.textContent = message;
+}
+
+function applySimulationChanges(owners, changes) {
+  for (const encoded of changes) owners[encoded >>> 1] = encoded & 1;
+}
+
+function simulatedCityOwners(simulationOwners) {
+  const owners = new Uint8Array(state.simulation.grid.cityCells.length);
+  owners.fill(255);
+  for (let cityIndex = 0; cityIndex < owners.length; cityIndex += 1) {
+    const cell = state.simulation.grid.cityCells[cityIndex];
+    if (cell < 0) continue;
+    owners[cityIndex] = simulationOwners[cell] === state.simulation.grid.owners[cell]
+      ? state.simulation.base.entry.cityOwners[cityIndex]
+      : simulationOwners[cell];
+  }
+  return owners;
+}
+
+function cityControlDelta(owners) {
+  const baseOwners = state.simulation.base?.entry.cityOwners;
+  let red = 0;
+  let blue = 0;
+  if (!baseOwners || !owners) return { red, blue };
+  for (let index = 0; index < baseOwners.length; index += 1) {
+    if (baseOwners[index] > 1 || owners[index] > 1) continue;
+    if (owners[index] === 1) red += 1;
+    if (baseOwners[index] === 1) red -= 1;
+    if (owners[index] === 0) blue += 1;
+    if (baseOwners[index] === 0) blue -= 1;
+  }
+  return { red, blue };
+}
+
+function renderSimulationCityTimeline() {
+  const frames = state.simulation.frames;
+  if (!state.simulation.active || frames.length === 0) {
+    els.simulationCityRedLine.setAttribute("d", "");
+    els.simulationCityBlueLine.setAttribute("d", "");
+    return;
+  }
+  const simulationOwners = new Int8Array(state.simulation.grid.owners);
+  const points = frames.map((frame, index) => {
+    if (index > 0) applySimulationChanges(simulationOwners, frame.changes);
+    return cityControlDelta(simulatedCityOwners(simulationOwners));
+  });
+  const extent = Math.max(1, ...points.flatMap((point) => [Math.abs(point.red), Math.abs(point.blue)]));
+  const pathFor = (faction) => points.map((point, index) => {
+    const x = (index / state.simulation.steps) * 1000;
+    const y = 22 - (point[faction] / extent) * 18;
+    return `${index === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(" ");
+  els.simulationCityRedLine.setAttribute("d", pathFor("red"));
+  els.simulationCityBlueLine.setAttribute("d", pathFor("blue"));
+}
+
+function updateSimulationCityCursor(index) {
+  const x = (index / state.simulation.steps) * 1000;
+  els.simulationCityCursor.setAttribute("x1", x);
+  els.simulationCityCursor.setAttribute("x2", x);
+}
+
+function releaseSimulationSnapshot() {
+  if (state.simulation.snapshotCanvas) {
+    state.simulation.snapshotCanvas.width = 1;
+    state.simulation.snapshotCanvas.height = 1;
+  }
+  state.simulation.snapshotCanvas = null;
+  state.simulation.baseRgba = null;
+}
+
+function buildSimulationSnapshot(step) {
+  const { row, entry: baseEntry } = state.simulation.base;
+  const width = row.width;
+  const height = row.height;
+  const rgba = new Uint8ClampedArray(state.simulation.baseRgba);
+  const simulationOwners = new Int8Array(state.simulation.grid.owners);
+  for (let frameIndex = 1; frameIndex <= step; frameIndex += 1) {
+    const changes = state.simulation.frames[frameIndex].changes;
+    applySimulationChanges(simulationOwners, changes);
+    for (const encoded of changes) {
+      const pixel = encoded >>> 1;
+      const color = (encoded & 1) === 1 ? RED_RGB : BLUE_RGB;
+      const offset = pixel * 4;
+      rgba[offset] = color[0];
+      rgba[offset + 1] = color[1];
+      rgba[offset + 2] = color[2];
+    }
+  }
+
+  let canvas = state.simulation.snapshotCanvas;
+  if (!canvas) {
+    canvas = document.createElement("canvas");
+    state.simulation.snapshotCanvas = canvas;
+  }
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  canvas.getContext("2d").putImageData(new ImageData(rgba, width, height), 0, 0);
+
+  const frame = state.simulation.frames[step];
+  return {
+    row,
+    entry: {
+      canvas,
+      red: baseEntry.red + frame.redDelta,
+      blue: baseEntry.blue + frame.blueDelta,
+      cityOwners: simulatedCityOwners(simulationOwners),
+      fronts: MEMORY_CONSTRAINED ? EMPTY_FRONTS : buildBattlefronts(row, rgba),
+    },
+  };
+}
+
+function renderSimulationMarkers() {
+  const overlay = els.simulationMarkers;
+  const showMarkers = state.simulation.active && els.showObjectives.checked;
+  const showPerimeters = state.simulation.active && els.showPerimeters.checked;
+  const visible = showMarkers || showPerimeters;
+  overlay.classList.toggle("is-hidden", !visible);
+  if (!visible) {
+    overlay.replaceChildren();
+    return;
+  }
+  const existingPerimeters = new Map(
+    [...overlay.querySelectorAll(".objective-perimeter-group")]
+      .map((group) => [Number(group.dataset.objectiveIndex), group]),
+  );
+  const activePerimeters = new Set();
+  const activeMarkers = new Set();
+  for (const faction of [0, 1]) {
+    const objective = state.simulation.objectives[faction];
+    if (!objective) continue;
+    if (showPerimeters) {
+      const frame = state.simulation.frames[state.simulation.frameIndex];
+      const radius = faction === 1 ? frame?.redRadius : frame?.blueRadius;
+      if (Number.isFinite(radius)) {
+        const factionClass = faction === 1 ? "red" : "blue";
+        let perimeter = existingPerimeters.get(faction);
+        if (!perimeter) {
+          perimeter = createObjectivePerimeter(
+            "http://www.w3.org/2000/svg",
+            faction,
+            factionClass,
+          );
+          overlay.prepend(perimeter);
+        }
+        activePerimeters.add(faction);
+        updateObjectivePerimeter(perimeter, {
+          x: objective.x,
+          y: objective.y,
+          distanceSquared: radius * radius,
+        });
+      }
+    }
+    if (!showMarkers) continue;
+    let marker = overlay.querySelector(`[data-simulation-faction="${faction}"]`);
+    if (!marker) {
+      marker = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      overlay.append(marker);
+    }
+    const factionName = faction === 1 ? "Red" : "Blue";
+    marker.setAttribute("class", `simulation-objective simulation-objective-${faction === 1 ? "red" : "blue"}`);
+    marker.setAttribute("d", starPath(objective.x, objective.y, 17));
+    marker.dataset.simulationFaction = String(faction);
+    marker.setAttribute("role", "button");
+    marker.setAttribute("tabindex", "0");
+    marker.setAttribute("aria-label", `Move simulated ${factionName} objective`);
+    activeMarkers.add(faction);
+  }
+  for (const [faction, perimeter] of existingPerimeters) {
+    if (!showPerimeters || !activePerimeters.has(faction)) perimeter.remove();
+  }
+  for (const marker of overlay.querySelectorAll("[data-simulation-faction]")) {
+    if (!showMarkers || !activeMarkers.has(Number(marker.dataset.simulationFaction))) marker.remove();
+  }
+}
+
+function renderSimulationFrame(rawIndex) {
+  if (!state.simulation.active || !state.simulation.base) return false;
+  const index = Math.max(0, Math.min(state.simulation.steps, rawIndex));
+  if (index > 0 && !state.simulation.ready) return false;
+  state.simulation.frameIndex = index;
+  els.slider.value = String(index);
+  updateSimulationCityCursor(index);
+  state.current = index === 0
+    ? state.simulation.base
+    : buildSimulationSnapshot(index);
+  drawMap();
+  updateStats(state.current.entry);
+  updateRegionStats();
+  updatePanels(state.simulation.base.row, index);
+  return true;
+}
+
+function cloneGridForWorker(grid) {
+  return {
+    width: grid.width,
+    height: grid.height,
+    mapWidth: grid.mapWidth,
+    mapHeight: grid.mapHeight,
+    owners: new Int8Array(grid.owners),
+    weights: new Uint16Array(grid.weights),
+    cityCells: new Int32Array(grid.cityCells),
+    islandIds: grid.islandIds ? new Uint32Array(grid.islandIds) : null,
+    islandAccess: grid.islandAccess ? new Uint8Array(grid.islandAccess) : null,
+  };
+}
+
+function completeSimulation(requestId, frames) {
+  if (!state.simulation.active || requestId !== state.simulation.requestId) return;
+  state.simulation.frames = frames;
+  renderSimulationCityTimeline();
+  setSimulationPhase("ready", "Ready · 96 simulated snapshots");
+  renderSimulationFrame(state.simulation.frameIndex);
+}
+
+function failSimulation(requestId, error) {
+  if (!state.simulation.active || requestId !== state.simulation.requestId) return;
+  setSimulationPhase("error", `Simulation failed: ${error.message || error}`);
+}
+
+function getSimulationWorker() {
+  if (state.simulation.worker || typeof Worker === "undefined") return state.simulation.worker;
+  const worker = new Worker("objective-simulator.js");
+  worker.addEventListener("message", (event) => {
+    const message = event.data;
+    if (message.type === "complete") completeSimulation(message.requestId, message.frames);
+    else if (message.type === "error") failSimulation(message.requestId, message.error);
+  });
+  worker.addEventListener("error", (event) => {
+    failSimulation(state.simulation.requestId, event.message || "Worker error");
+  });
+  state.simulation.worker = worker;
+  return worker;
+}
+
+function runSimulation() {
+  if (!state.simulation.active || !state.simulation.base) return;
+  setSimulationPhase("computing", "Simulating 48 hours…");
+  const requestId = ++state.simulation.requestId;
+  const grid = buildSimulationGrid(state.simulation.base.row, state.simulation.base.entry);
+  let worker;
+  try {
+    worker = getSimulationWorker();
+  } catch (error) {
+    failSimulation(requestId, error);
+    return;
+  }
+  if (worker) {
+    const workerGrid = cloneGridForWorker(grid);
+    const transferList = [
+      workerGrid.owners.buffer,
+      workerGrid.weights.buffer,
+      workerGrid.cityCells.buffer,
+    ];
+    if (workerGrid.islandIds) transferList.push(workerGrid.islandIds.buffer);
+    if (workerGrid.islandAccess) transferList.push(workerGrid.islandAccess.buffer);
+    worker.postMessage({
+      type: "simulate",
+      requestId,
+      grid: workerGrid,
+      objectives: state.simulation.objectives,
+      gains: state.simulation.gains,
+      steps: state.simulation.steps,
+    }, transferList);
+    return;
+  }
+  setTimeout(() => {
+    try {
+      const frames = ObjectiveSimulator.simulateCampaignTimeline(
+        grid,
+        state.simulation.objectives,
+        state.simulation.gains,
+        state.simulation.steps,
+      );
+      completeSimulation(requestId, frames);
+    } catch (error) {
+      failSimulation(requestId, error);
+    }
+  }, 0);
+}
+
+function scheduleSimulation(delay = 1800) {
+  if (!state.simulation.active) return;
+  setPlaying(false);
+  clearTimeout(state.simulation.debounceTimer);
+  state.simulation.requestId += 1;
+  state.simulation.frames = [];
+  renderSimulationCityTimeline();
+  setSimulationPhase("waiting", "Waiting for changes to settle…");
+  state.simulation.frameIndex = 0;
+  renderSimulationFrame(0);
+  state.simulation.debounceTimer = setTimeout(runSimulation, delay);
+}
+
+async function setSimulationMode(active) {
+  if (active === state.simulation.active) return;
+  setPlaying(false);
+  els.simulationToggle.disabled = true;
+  if (!active) {
+    clearTimeout(state.simulation.debounceTimer);
+    state.simulation.requestId += 1;
+    state.simulation.active = false;
+    state.simulation.phase = "off";
+    state.simulation.ready = false;
+    state.simulation.frames = [];
+    state.simulation.frameIndex = 0;
+    els.simulationControls.hidden = true;
+    els.simulationToggle.textContent = "Enable simulation";
+    els.simulationToggle.setAttribute("aria-pressed", "false");
+    els.playBtn.disabled = false;
+    els.playSpeed.disabled = false;
+    els.slider.disabled = false;
+    renderSimulationMarkers();
+    releaseSimulationSnapshot();
+    updateTimelineRange();
+    await setIndex(state.rows.length - 1);
+    els.simulationToggle.disabled = false;
+    return;
+  }
+
+  await setIndex(state.rows.length - 1);
+  state.simulation.active = true;
+  state.simulation.base = state.current;
+  state.simulation.frameIndex = 0;
+  state.simulation.frames = [];
+  state.simulation.grid = null;
+  state.simulation.gridHash = null;
+  ensureSimulationObjectives(state.simulation.base.row);
+  buildSimulationGrid(state.simulation.base.row, state.simulation.base.entry);
+  els.simulationControls.hidden = false;
+  els.simulationToggle.disabled = false;
+  els.simulationToggle.textContent = "Exit simulation";
+  els.simulationToggle.setAttribute("aria-pressed", "true");
+  updateTimelineRange();
+  renderSimulationFrame(0);
+  scheduleSimulation();
+}
+
+function setupSimulationMode() {
+  updateGainReadout();
+  els.simulationToggle.addEventListener("click", () => {
+    void setSimulationMode(!state.simulation.active);
+  });
+  els.gainSlider.addEventListener("input", () => {
+    state.simulation.balance = Number(els.gainSlider.value);
+    updateGainReadout();
+    scheduleSimulation();
+  });
+  els.simulationMarkers.addEventListener("pointerdown", (event) => {
+    const marker = event.target.closest?.("[data-simulation-faction]");
+    if (!marker) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setPlaying(false);
+    clearTimeout(state.simulation.debounceTimer);
+    state.simulation.requestId += 1;
+    state.simulation.frames = [];
+    renderSimulationCityTimeline();
+    setSimulationPhase("waiting", "Move objective, then release to simulate…");
+    state.simulation.frameIndex = 0;
+    renderSimulationFrame(0);
+    state.simulation.dragging = {
+      pointerId: event.pointerId,
+      faction: Number(marker.dataset.simulationFaction),
+    };
+    els.simulationMarkers.setPointerCapture(event.pointerId);
+  });
+  els.simulationMarkers.addEventListener("pointermove", (event) => {
+    const drag = state.simulation.dragging;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    state.simulation.objectives[drag.faction] = regionPoint(event);
+    state.simulation.customized[drag.faction] = true;
+    renderSimulationMarkers();
+  });
+  const finishDrag = (event) => {
+    if (!state.simulation.dragging || state.simulation.dragging.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    state.simulation.dragging = null;
+    scheduleSimulation();
+  };
+  els.simulationMarkers.addEventListener("pointerup", finishDrag);
+  els.simulationMarkers.addEventListener("pointercancel", finishDrag);
+  els.simulationMarkers.addEventListener("keydown", (event) => {
+    const marker = event.target.closest?.("[data-simulation-faction]");
+    if (!marker || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const faction = Number(marker.dataset.simulationFaction);
+    const objective = state.simulation.objectives[faction];
+    const amount = event.shiftKey ? 20 : 5;
+    if (event.key === "ArrowLeft") objective.x -= amount;
+    if (event.key === "ArrowRight") objective.x += amount;
+    if (event.key === "ArrowUp") objective.y -= amount;
+    if (event.key === "ArrowDown") objective.y += amount;
+    objective.x = Math.max(0, Math.min(MAP_W, objective.x));
+    objective.y = Math.max(0, Math.min(MAP_H, objective.y));
+    state.simulation.customized[faction] = true;
+    renderSimulationMarkers();
+    scheduleSimulation();
+  });
+}
+
 function updateOverlayViews() {
   const { scale, tx, ty } = state.view;
   const rect = els.viewport.getBoundingClientRect();
@@ -761,6 +1291,7 @@ function updateOverlayViews() {
   const viewBox = `${-tx / scale} ${-ty / scale} ${rect.width / scale} ${rect.height / scale}`;
   els.cityOverlay.setAttribute("viewBox", viewBox);
   els.objectiveOverlay.setAttribute("viewBox", viewBox);
+  els.simulationMarkers.setAttribute("viewBox", viewBox);
   scheduleDensityLabelLayout();
 }
 
@@ -1505,10 +2036,58 @@ const timeFormat = new Intl.DateTimeFormat(undefined, {
   weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
 });
 
-function updatePanels(row) {
-  const captured = new Date(row.capturedAt * 1000);
+function updateTimelineCityChange(simulationStep) {
+  const output = els.timelineCityChange;
+  output.hidden = !state.simulation.active;
+  if (!state.simulation.active) return;
+
+  const baseOwners = state.simulation.base?.entry.cityOwners;
+  const currentOwners = state.current?.entry.cityOwners;
+  let redGained = 0;
+  let redLost = 0;
+  let blueGained = 0;
+  let blueLost = 0;
+  if (simulationStep > 0 && baseOwners && currentOwners) {
+    for (let index = 0; index < baseOwners.length; index += 1) {
+      const before = baseOwners[index];
+      const after = currentOwners[index];
+      if (before === after || before > 1 || after > 1) continue;
+      if (after === 1) {
+        redGained += 1;
+        blueLost += 1;
+      } else {
+        blueGained += 1;
+        redLost += 1;
+      }
+    }
+  }
+
+  output.replaceChildren();
+  const label = document.createTextNode("Cities · ");
+  const red = document.createElement("span");
+  red.className = "red";
+  red.textContent = `Red +${redGained} / −${redLost}`;
+  const separator = document.createTextNode(" · ");
+  const blue = document.createElement("span");
+  blue.className = "blue";
+  blue.textContent = `Blue +${blueGained} / −${blueLost}`;
+  output.append(label, red, separator, blue);
+}
+
+function updatePanels(row, simulationStep = 0) {
+  const capturedAt = row.capturedAt + simulationStep * 30 * 60;
+  const captured = new Date(capturedAt * 1000);
   els.timelineLabel.textContent = timeFormat.format(captured);
-  els.timelinePos.textContent = `Snapshot ${state.index + 1} of ${state.rows.length}`;
+  if (simulationStep > 0) {
+    const frame = state.simulation.frames[simulationStep];
+    const front = frame?.contested ? "contested front" : "separate fronts";
+    els.timelinePos.textContent = `Simulated +${simulationStep * 30} min · ${front}`;
+  } else if (state.simulation.active) {
+    els.timelinePos.textContent = "Actual · latest snapshot";
+  } else {
+    els.timelinePos.textContent = `Snapshot ${state.index + 1} of ${state.rows.length}`;
+  }
+  updateTimelineCityChange(simulationStep);
   if (els.newsText.textContent !== row.news) els.newsText.textContent = row.news || "No dispatches.";
 }
 
@@ -1559,15 +2138,15 @@ function setIndex(rawIndex) {
   if (state.rows.length === 0) return Promise.resolve(false);
   const index = Math.max(0, Math.min(state.rows.length - 1, rawIndex));
   state.index = index;
-  const row = state.rows[index];
-  els.slider.value = String(index);
-  updatePanels(row);
+  if (!state.simulation.active) els.slider.value = String(index);
   scheduleAnalytics(); // keep the chart marker and log highlight in sync
   const token = ++state.renderToken;
   clearTimeout(state.loadingTimer);
   state.loadingTimer = null;
   els.loading.hidden = true;
 
+  const row = state.rows[index];
+  updatePanels(row);
   return new Promise((resolve) => {
     if (state.queuedRender) state.queuedRender.resolve(false);
     state.queuedRender = { row, token, resolve };
@@ -1581,6 +2160,12 @@ function prefetch(fromIndex, count) {
     pending.push(getDecoded(state.rows[i]));
   }
   return Promise.allSettled(pending);
+}
+
+function setTimelineIndex(index) {
+  return state.simulation.active
+    ? Promise.resolve(renderSimulationFrame(index))
+    : setIndex(index);
 }
 
 function playbackBufferSize() {
@@ -1598,6 +2183,7 @@ function playbackWarmupSize() {
 /* ---------- Timeline playback ---------- */
 
 function setPlaying(playing) {
+  if (playing && state.simulation.active && !state.simulation.ready) return;
   state.playing = playing;
   const generation = ++state.playbackGeneration;
   els.playBtn.textContent = playing ? "⏸" : "▶";
@@ -1607,16 +2193,18 @@ function setPlaying(playing) {
 }
 
 async function startPlayback(generation) {
-  const next = state.index + 1;
-  if (next >= state.rows.length) {
+  const next = currentTimelineIndex() + 1;
+  if (next > timelineLastIndex()) {
     setPlaying(false);
     return;
   }
-  const warmupSize = playbackWarmupSize();
-  await prefetch(next, warmupSize);
+  const warmupSize = state.simulation.active ? 0 : playbackWarmupSize();
+  if (warmupSize > 0) await prefetch(next, warmupSize);
   if (!state.playing || generation !== state.playbackGeneration) return;
   state.playbackNextAt = performance.now();
-  void prefetch(next + warmupSize, playbackBufferSize() - warmupSize);
+  if (!state.simulation.active) {
+    void prefetch(next + warmupSize, playbackBufferSize() - warmupSize);
+  }
   void playbackTick(generation);
 }
 
@@ -1625,22 +2213,22 @@ async function playbackTick(generation) {
   const interval = Number(els.playSpeed.value);
   const lag = Math.max(0, performance.now() - state.playbackNextAt);
   const skippedFrames = Math.floor(lag / interval);
-  const next = state.index + 1 + skippedFrames;
-  if (next >= state.rows.length) {
+  const next = currentTimelineIndex() + 1 + skippedFrames;
+  if (next > timelineLastIndex()) {
     setPlaying(false);
     return;
   }
   state.playbackNextAt += (skippedFrames + 1) * interval;
-  const rendered = await setIndex(next);
+  const rendered = await setTimelineIndex(next);
   if (!rendered || !state.playing || generation !== state.playbackGeneration) return;
-  void prefetch(next + 1, playbackBufferSize());
+  if (!state.simulation.active) void prefetch(next + 1, playbackBufferSize());
   const delay = Math.max(0, state.playbackNextAt - performance.now());
   state.playTimer = setTimeout(() => playbackTick(generation), delay);
 }
 
 function togglePlay() {
-  if (!state.playing && state.index >= state.rows.length - 1) {
-    setIndex(0).then((rendered) => {
+  if (!state.playing && currentTimelineIndex() >= timelineLastIndex()) {
+    setTimelineIndex(0).then((rendered) => {
       if (rendered) setPlaying(true);
     });
     return;
@@ -1657,8 +2245,7 @@ async function loadOlder() {
     state.rows = older.concat(state.rows);
     state.nextBefore = page.nextBefore;
     state.index += older.length;
-    els.slider.max = String(state.rows.length - 1);
-    els.slider.value = String(state.index);
+    updateTimelineRange();
     updatePanels(state.rows[state.index]);
     els.loadOlder.hidden = !state.nextBefore;
     queueStats(older);
@@ -1696,12 +2283,26 @@ async function refreshLive() {
       state.rows.push(latest);
       seedPrecomputedStats([latest]);
       void cacheTimelineRows([latest]).catch(() => {});
-      els.slider.max = String(state.rows.length - 1);
+      updateTimelineRange();
       queueStats([latest]);
       queueRegionStats([latest]);
       scheduleAnalytics();
-      if (wasAtEnd && !state.playing) setIndex(state.rows.length - 1);
-      else updatePanels(state.rows[state.index]);
+      if (state.simulation.active) {
+        setPlaying(false);
+        state.simulation.frameIndex = 0;
+        await setIndex(state.rows.length - 1);
+        state.simulation.base = state.current;
+        state.simulation.grid = null;
+        state.simulation.gridHash = null;
+        ensureSimulationObjectives(latest);
+        updateTimelineRange();
+        renderSimulationFrame(0);
+        scheduleSimulation();
+      } else if (wasAtEnd && !state.playing) {
+        await setIndex(state.rows.length - 1);
+      } else {
+        updatePanels(state.rows[state.index]);
+      }
     }
   } catch {
     /* transient poll failure — keep showing the last known status */
@@ -2995,7 +3596,11 @@ function setupAnalytics() {
     const tr = event.target.closest("tr[data-index]");
     if (!tr) return;
     setPlaying(false);
-    setIndex(Number(tr.dataset.index));
+    if (state.simulation.active) {
+      void setSimulationMode(false).then(() => setIndex(Number(tr.dataset.index)));
+    } else {
+      setIndex(Number(tr.dataset.index));
+    }
   });
   new ResizeObserver(scheduleAnalytics).observe(els.chartWrap);
 }
@@ -3028,6 +3633,10 @@ async function loadLeaderboardPlayerColors() {
 }
 
 const LEADERBOARD_HISTORY_LIMIT = 336;
+const LEADERBOARD_MAX_PLAYERS = 100;
+const LEADERBOARD_DISPLAY_MINIMUM = 10;
+const LEADERBOARD_DISPLAY_MAXIMUM = 100;
+const LEADERBOARD_DISPLAY_STEP = 10;
 let leaderboardTimelineView = null;
 let leaderboardTimelineDrag = null;
 let leaderboardTimelineSuppressClick = false;
@@ -3040,8 +3649,12 @@ function leaderboardValueUnit(metric) {
   return metric === "elo" ? "ELO" : "net wins";
 }
 
+function leaderboardTopLabel() {
+  return `top ${state.leaderboards.displayLimit}`;
+}
+
 function leaderboardMovementValue(value, unit = leaderboardValueUnit(state.leaderboards.metric)) {
-  return `${value >= 0 ? "Blue" : "Red"} top-20 total leads by ${Math.abs(Math.round(value)).toLocaleString()} ${unit}`;
+  return `${value >= 0 ? "Blue" : "Red"} ${leaderboardTopLabel()} total leads by ${Math.abs(Math.round(value)).toLocaleString()} ${unit}`;
 }
 
 function normalizeLeaderboardHistory(rows) {
@@ -3053,7 +3666,7 @@ function normalizeLeaderboardHistory(rows) {
     const normalized = { capturedAt };
     for (const metric of ["elo", "world"]) {
       const board = Array.isArray(row[metric]) ? row[metric] : [];
-      normalized[metric] = board.slice(0, 20).map((player, index) => ({
+      normalized[metric] = board.slice(0, LEADERBOARD_MAX_PLAYERS).map((player, index) => ({
         ...player,
         nickname: String(player?.nickname ?? "Unknown player"),
         rank: Number.isFinite(Number(player?.rank)) ? Number(player.rank) : index + 1,
@@ -3080,7 +3693,8 @@ function currentLeaderboardHistory() {
 
 function renderLeaderboardGraph() {
   const metric = state.leaderboards.metric;
-  const rows = state.leaderboards[metric];
+  const limit = state.leaderboards.displayLimit;
+  const rows = state.leaderboards[metric].slice(0, limit);
   const svg = els.leaderboardGraph;
   const width = 1000;
   const rowHeight = 31;
@@ -3091,13 +3705,13 @@ function renderLeaderboardGraph() {
   const plotWidth = plotRight - plotLeft;
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.removeAttribute("height");
-  svg.setAttribute("aria-label", metric === "elo" ? "Top 20 ELO ratings" : "Top 20 world net wins");
+  svg.setAttribute("aria-label", metric === "elo" ? `Top ${limit} ELO ratings` : `Top ${limit} world net wins`);
   svg.replaceChildren();
 
   const title = svgEl("title", {});
-  title.textContent = `${leaderboardMetricLabel(metric)} top 20 at a glance`;
+  title.textContent = `${leaderboardMetricLabel(metric)} top ${limit} at a glance`;
   const description = svgEl("desc", {});
-  description.textContent = `Horizontal bars compare the current top 20 players by ${leaderboardValueUnit(metric)}.`;
+  description.textContent = `Horizontal bars compare the current top ${limit} players by ${leaderboardValueUnit(metric)}.`;
   svg.append(title, description);
 
   if (rows.length === 0) {
@@ -3130,8 +3744,8 @@ function renderLeaderboardGraph() {
   });
 
   els.leaderboardGraphDescription.textContent = metric === "elo"
-    ? `Current top-20 ELO ratings · scale begins at ${baseline.toLocaleString()}.`
-    : "Current top-20 World standings by net wins · bars use each player’s faction color when available.";
+    ? `Current top-${limit} ELO ratings · scale begins at ${baseline.toLocaleString()}.`
+    : `Current top-${limit} World standings by net wins · bars use each player’s faction color when available.`;
 }
 
 function leaderboardTimelinePath(points, xOf, yOf) {
@@ -3223,9 +3837,12 @@ function packLeaderboardTimelineLabels(series, yOf, minimum, maximum, gap) {
 function setLeaderboardTimelineHighlight(playerKey) {
   const svg = els.leaderboardTimeline;
   const activeKey = playerKey || state.leaderboards.highlightedPlayer;
-  for (const node of svg.querySelectorAll("[data-player-key]")) {
-    const active = Boolean(activeKey) && node.dataset.playerKey === activeKey;
-    node.classList.toggle("is-highlighted", active);
+  svg.classList.toggle("has-highlight", Boolean(activeKey));
+  for (const container of [svg, els.leaderboardTimelineRoster]) {
+    for (const node of container.querySelectorAll("[data-player-key]")) {
+      const active = Boolean(activeKey) && node.dataset.playerKey === activeKey;
+      node.classList.toggle("is-highlighted", active);
+    }
   }
 }
 
@@ -3268,7 +3885,7 @@ function showLeaderboardTimelineTooltip(point, series, snapshot) {
     ? (series.movement
       ? leaderboardMovementValue(point.value)
       : `Rank #${point.rank} · ${Math.round(point.value).toLocaleString()} ${leaderboardValueUnit(state.leaderboards.metric)}`)
-    : (series.movement ? "Faction totals unavailable at this snapshot" : "Outside the top 20 at this snapshot");
+    : (series.movement ? "Faction totals unavailable at this snapshot" : `Outside the ${leaderboardTopLabel()} at this snapshot`);
   const content = [time, player, value];
   if (point) {
     const baseline = series.points.find(Boolean);
@@ -3305,19 +3922,20 @@ function showLeaderboardTimelineTooltip(point, series, snapshot) {
 function renderLeaderboardTimeline() {
   const metric = state.leaderboards.metric;
   const movementMode = state.leaderboards.timelineView === "movement";
-  const currentPlayers = state.leaderboards[metric].slice(0, 20);
+  const limit = state.leaderboards.displayLimit;
+  const currentPlayers = state.leaderboards[metric].slice(0, limit);
   const snapshots = rowsForTimeRange(
     currentLeaderboardHistory(),
     state.leaderboards.timelineRange,
     (snapshot) => snapshot.capturedAt,
   );
   const svg = els.leaderboardTimeline;
-  const width = 1200;
+  const width = Math.max(760, Math.round(els.leaderboardTimelineWrap.clientWidth || 1200));
   const height = 650;
   const top = 38;
   const bottom = 54;
   const plotLeft = 54;
-  const plotRight = movementMode ? width - 28 : 830;
+  const plotRight = width - 28;
   const labelLeft = 858;
   const labelValueX = 1180;
   const labelDeltaX = labelValueX - 64;
@@ -3329,9 +3947,11 @@ function renderLeaderboardTimeline() {
 
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.setAttribute("aria-label", movementMode
-    ? `Top 20 ${leaderboardMetricLabel(metric)} faction advantage over time with war land momentum`
-    : `Top 20 ${leaderboardMetricLabel(metric)} value history`);
+    ? `Top ${limit} ${leaderboardMetricLabel(metric)} faction advantage over time with war land momentum`
+    : `Top ${limit} ${leaderboardMetricLabel(metric)} value history`);
   svg.replaceChildren();
+  els.leaderboardTimelineRoster.replaceChildren();
+  els.leaderboardTimelineRoster.hidden = movementMode;
   leaderboardTimelineView = null;
   leaderboardTimelineDrag = null;
 
@@ -3339,22 +3959,22 @@ function renderLeaderboardTimeline() {
   title.textContent = `${leaderboardMetricLabel(metric)} ${movementMode ? "faction advantage" : "player value momentum"}`;
   const description = svgEl("desc", {});
   description.textContent = movementMode
-    ? `One slope-colored line shows combined Blue ${leaderboardValueUnit(metric)} minus combined Red ${leaderboardValueUnit(metric)} within each snapshot’s actual top 20: up is Blue and down is Red. The dotted, slope-colored war land line uses an independent percentage scale.`
-    : `Lines show every player who appeared in the visible top-20 history. Latest labels remain limited to the current top 20; gaps mean the player was outside the top 20.`;
+    ? `One slope-colored line shows combined Blue ${leaderboardValueUnit(metric)} minus combined Red ${leaderboardValueUnit(metric)} within each snapshot’s actual top ${limit}: up is Blue and down is Red. The dotted, slope-colored war land line uses an independent percentage scale.`
+    : `Lines show every player who appeared in the visible top-${limit} history. Latest labels remain limited to the current top ${limit}; gaps mean the player was outside the top ${limit}.`;
   svg.append(title, description);
 
   if (currentPlayers.length === 0 || snapshots.length === 0) {
     const empty = svgEl("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "leaderboard-graph-empty" });
     empty.textContent = state.leaderboards.historyError ? "Leaderboard history is temporarily unavailable." : "Waiting for leaderboard history…";
     svg.append(empty);
-    els.leaderboardTimelineDescription.textContent = `Seven days of ${leaderboardMetricLabel(metric)} value progress for today’s top 20.`;
+    els.leaderboardTimelineDescription.textContent = `Seven days of ${leaderboardMetricLabel(metric)} value progress for today’s top ${limit}.`;
     els.leaderboardTimelineStatus.textContent = state.leaderboards.historyError ? "History unavailable" : "Loading history…";
     return;
   }
 
   const snapshotLookups = snapshots.map((snapshot) => {
     const players = new Map();
-    const board = Array.isArray(snapshot[metric]) ? snapshot[metric] : [];
+    const board = Array.isArray(snapshot[metric]) ? snapshot[metric].slice(0, limit) : [];
     board.forEach((player, index) => players.set(leaderboardPlayerKey(player.nickname), {
       ...player,
       rank: Number(player.rank) || index + 1,
@@ -3459,7 +4079,7 @@ function renderLeaderboardTimeline() {
     svg.append(empty);
     els.leaderboardTimelineDescription.textContent = movementMode
       ? "Movement needs both Red and Blue faction data in the visible history."
-      : `Visible ${leaderboardMetricLabel(metric)} history for everyone who reached the top 20.`;
+      : `Visible ${leaderboardMetricLabel(metric)} history for everyone who reached the top ${limit}.`;
     return;
   }
   let valueMinimum = Math.min(...historicalValues);
@@ -3529,21 +4149,9 @@ function renderLeaderboardTimeline() {
 
   const valueHeading = svgEl("text", { x: plotLeft, y: 18, class: "leaderboard-timeline-heading" });
   valueHeading.textContent = movementMode
-    ? (metric === "elo" ? "TOP-20 ELO DIFFERENCE" : "TOP-20 NET-WIN DIFFERENCE")
+    ? (metric === "elo" ? `TOP-${limit} ELO DIFFERENCE` : `TOP-${limit} NET-WIN DIFFERENCE`)
     : (metric === "elo" ? "ELO" : "NET WINS");
   svg.append(valueHeading);
-  if (!movementMode) {
-    const latestHeading = svgEl("text", { x: labelLeft, y: 18, class: "leaderboard-timeline-heading" });
-    latestHeading.textContent = "LATEST STANDINGS";
-    svg.append(latestHeading, svgEl("line", {
-      x1: plotRight + 14,
-      x2: plotRight + 14,
-      y1: top - 18,
-      y2: height - bottom + 14,
-      class: "leaderboard-timeline-divider",
-    }));
-  }
-
   let timelineDefs = null;
   if (movementMode) {
     const samples = series[0].points.filter(Boolean);
@@ -3625,6 +4233,24 @@ function renderLeaderboardTimeline() {
 
   const lastX = xOf(xEnd);
   const labelSeries = movementMode ? [] : series.filter((player) => player.isCurrent);
+  for (const player of labelSeries) {
+    const rosterPlayer = document.createElement("button");
+    rosterPlayer.type = "button";
+    rosterPlayer.className = `leaderboard-roster-player ${player.faction}`;
+    rosterPlayer.dataset.playerKey = player.key;
+    rosterPlayer.setAttribute("aria-label", `${player.nickname}, rank ${player.rank}, ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`);
+    const rank = document.createElement("span");
+    rank.className = "leaderboard-roster-rank";
+    rank.textContent = `#${player.rank}`;
+    const name = document.createElement("span");
+    name.className = "leaderboard-roster-name";
+    name.textContent = player.nickname;
+    const value = document.createElement("span");
+    value.className = "leaderboard-roster-value";
+    value.textContent = Math.round(player.value).toLocaleString();
+    rosterPlayer.append(rank, name, value);
+    els.leaderboardTimelineRoster.append(rosterPlayer);
+  }
   const labelPositions = packLeaderboardTimelineLabels(labelSeries, yOf, top, height - bottom, 25);
   const deltaLabels = new Map();
   for (const player of labelSeries) {
@@ -3755,7 +4381,7 @@ function renderLeaderboardTimeline() {
     height,
     plotLeft,
     plotRight,
-    tooltipRight: movementMode ? null : plotRight + 14,
+    tooltipRight: null,
     top,
     bottom,
     xOf,
@@ -3775,9 +4401,9 @@ function renderLeaderboardTimeline() {
   const rangeEnd = new Date(xEnd * 1000);
   const rangeFormat = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
   if (movementMode) {
-    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · combined Blue minus combined Red within each snapshot’s top 20: up is Blue, down is Red; dotted war land uses the same direction colors on an independent scale.`;
+    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · combined Blue minus combined Red within each snapshot’s top ${limit}: up is Blue, down is Red; dotted war land uses the same direction colors on an independent scale.`;
   } else {
-    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · ${playerSeries.length.toLocaleString()} players who reached the top 20; gaps mean outside it.`;
+    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · ${playerSeries.length.toLocaleString()} players who reached the top ${limit}; gaps mean outside it.`;
   }
   els.leaderboardTimelineStatus.textContent = state.leaderboards.historyError
     ? "Update failed · showing saved history"
@@ -3855,13 +4481,13 @@ function renderLeaderboardTimelineDragTooltip(series, firstSnapshot, secondSnaps
     ? (series.movement
       ? `Start · ${leaderboardMovementValue(startPoint.value, unit)}`
       : `Start · #${startPoint.rank} · ${Math.round(startPoint.value).toLocaleString()} ${unit}`)
-    : (series.movement ? "Start · Faction totals unavailable" : "Start · Outside the top 20");
+    : (series.movement ? "Start · Faction totals unavailable" : `Start · Outside the ${leaderboardTopLabel()}`);
   const endValue = document.createElement("div");
   endValue.textContent = endPoint
     ? (series.movement
       ? `End · ${leaderboardMovementValue(endPoint.value, unit)}`
       : `End · #${endPoint.rank} · ${Math.round(endPoint.value).toLocaleString()} ${unit}`)
-    : (series.movement ? "End · Faction totals unavailable" : "End · Outside the top 20");
+    : (series.movement ? "End · Faction totals unavailable" : `End · Outside the ${leaderboardTopLabel()}`);
   const content = [range, duration, player, startValue, endValue];
 
   if (startPoint && endPoint) {
@@ -3884,12 +4510,12 @@ function renderLeaderboardTimelineDragTooltip(series, firstSnapshot, secondSnaps
     progress.className = "tt-change leaderboard-progress-up";
     progress.textContent = series.movement
       ? "Faction totals became available"
-      : `Entered the top 20 at #${endPoint.rank}`;
+      : `Entered the ${leaderboardTopLabel()} at #${endPoint.rank}`;
     content.push(progress);
   } else if (startPoint && !endPoint) {
     const progress = document.createElement("div");
     progress.className = "tt-change leaderboard-progress-down";
-    progress.textContent = series.movement ? "Faction totals became unavailable" : "Exited the top 20";
+    progress.textContent = series.movement ? "Faction totals became unavailable" : `Exited the ${leaderboardTopLabel()}`;
     content.push(progress);
   }
 
@@ -3997,6 +4623,7 @@ function resetLeaderboardTimelineDrag(event) {
 
 function setupLeaderboardTimelineInteractions() {
   const svg = els.leaderboardTimeline;
+  const roster = els.leaderboardTimelineRoster;
   svg.addEventListener("pointerdown", leaderboardTimelinePointerDown);
   svg.addEventListener("pointermove", leaderboardTimelinePointerMove);
   svg.addEventListener("pointerup", resetLeaderboardTimelineDrag);
@@ -4034,6 +4661,23 @@ function setupLeaderboardTimelineInteractions() {
     hideLeaderboardTimelineTooltip();
     setLeaderboardTimelineHighlight();
   });
+  roster.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
+    if (!target) return;
+    const key = target.dataset.playerKey;
+    state.leaderboards.highlightedPlayer = state.leaderboards.highlightedPlayer === key ? null : key;
+    setLeaderboardTimelineHighlight();
+  });
+  roster.addEventListener("pointerover", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
+    if (target) setLeaderboardTimelineHighlight(target.dataset.playerKey);
+  });
+  roster.addEventListener("pointerleave", () => setLeaderboardTimelineHighlight());
+  roster.addEventListener("focusin", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
+    if (target) setLeaderboardTimelineHighlight(target.dataset.playerKey);
+  });
+  roster.addEventListener("focusout", () => setTimeout(() => setLeaderboardTimelineHighlight(), 0));
 }
 
 function updateLeaderboardTimelineControls() {
@@ -4050,6 +4694,22 @@ function updateLeaderboardTimelineControls() {
 }
 
 function setupLeaderboards() {
+  const setDisplayLimit = (value) => {
+    const rawLimit = Number(value);
+    const steppedLimit = Math.round(rawLimit / LEADERBOARD_DISPLAY_STEP) * LEADERBOARD_DISPLAY_STEP;
+    const limit = Math.max(LEADERBOARD_DISPLAY_MINIMUM, Math.min(LEADERBOARD_DISPLAY_MAXIMUM, steppedLimit));
+    state.leaderboards.displayLimit = limit;
+    els.leaderboardLimitSlider.value = String(limit);
+    els.leaderboardLimitSlider.setAttribute("aria-valuetext", `Top ${limit}`);
+    els.leaderboardLimitOutput.value = `Top ${limit}`;
+    els.leaderboardLimitOutput.textContent = `Top ${limit}`;
+    state.leaderboards.highlightedPlayer = null;
+    hideLeaderboardTimelineTooltip();
+    renderLeaderboardGraph();
+    renderLeaderboardTimeline();
+  };
+  els.leaderboardLimitSlider.addEventListener("input", () => setDisplayLimit(els.leaderboardLimitSlider.value));
+  setDisplayLimit(state.leaderboards.displayLimit);
   for (const button of els.leaderboardTimelineRangeButtons) {
     button.addEventListener("click", () => {
       const range = button.dataset.leaderboardTimelineRange;
@@ -4109,8 +4769,8 @@ async function refreshLeaderboards() {
     if (!Array.isArray(data.elo) || !Array.isArray(data.world)) {
       currentError = new Error("Invalid leaderboard data.");
     } else {
-      state.leaderboards.elo = data.elo.slice(0, 20);
-      state.leaderboards.world = data.world.slice(0, 20);
+      state.leaderboards.elo = data.elo.slice(0, LEADERBOARD_MAX_PLAYERS);
+      state.leaderboards.world = data.world.slice(0, LEADERBOARD_MAX_PLAYERS);
       state.leaderboards.fetchedAt = Number(data.capturedAt ?? data.fetchedAt) || Math.floor(Date.now() / 1000);
     }
   } else {
@@ -4362,19 +5022,16 @@ function setupViewport() {
 /* ---------- Wiring ---------- */
 
 function setupControls() {
+  setupSimulationMode();
   els.slider.addEventListener("input", () => {
     setPlaying(false);
-    setIndex(Number(els.slider.value));
+    setTimelineIndex(Number(els.slider.value));
   });
   els.playBtn.addEventListener("click", togglePlay);
   els.playSpeed.addEventListener("change", () => {
     if (state.playing) setPlaying(true);
   });
   els.loadOlder.addEventListener("click", loadOlder);
-  els.overlayAlpha.addEventListener("input", () => {
-    state.overlayAlpha = Number(els.overlayAlpha.value) / 100;
-    drawMap();
-  });
   els.showCities.addEventListener("change", drawMap);
   els.showObjectives.addEventListener("change", drawMap);
   els.showPerimeters.addEventListener("change", drawMap);
@@ -4434,10 +5091,10 @@ function setupControls() {
       setRegionSelection(false);
     } else if (event.key === "ArrowLeft") {
       setPlaying(false);
-      setIndex(state.index - 1);
+      setTimelineIndex(currentTimelineIndex() - 1);
     } else if (event.key === "ArrowRight") {
       setPlaying(false);
-      setIndex(state.index + 1);
+      setTimelineIndex(currentTimelineIndex() + 1);
     }
   });
 }
@@ -4559,8 +5216,9 @@ async function init() {
       showError("No snapshots have been captured yet. Check back soon!");
       return;
     }
-    els.slider.max = String(state.rows.length - 1);
+    updateTimelineRange();
     await setIndex(state.rows.length - 1);
+    els.simulationToggle.disabled = false;
     if (els.showCityDensity.checked) initializeIslandFeatures();
     // Paint the current map before filling charts. Rows with server-computed
     // totals need no map download; the queue only handles legacy fallback rows.

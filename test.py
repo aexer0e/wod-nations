@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the War of Dots ELO and World top-20 leaderboards."""
+"""Fetch the War of Dots ELO and World top-100 leaderboards."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 get_leaderboard.py
 #!/usr/bin/env python3
-"""Fetch the War of Dots ELO and World top-20 leaderboards."""
+"""Fetch the War of Dots ELO and World top-100 leaderboards."""
 
 from __future__ import annotations
 
