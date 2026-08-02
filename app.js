@@ -157,7 +157,7 @@ const state = {
     historyError: null,
     metric: "world",
     displayLimit: 20,
-    highlightedPlayer: null,
+    selectedPlayers: new Set(),
     timelineView: "players",
     timelineRange: "all",
   },
@@ -3273,8 +3273,8 @@ function renderChartPointTooltip(point) {
       const landFaction = point.landMovement > 0 ? "blue" : point.landMovement < 0 ? "red" : null;
       land.className = landFaction ? `tt-${landFaction}` : "";
       land.textContent = Math.abs(point.landMovement) < 0.0005
-        ? "Land / pixels · No net movement"
-        : `Land / pixels · ${landFaction === "blue" ? "Blue" : "Red"} +${Math.abs(point.landMovement).toFixed(3)}%`;
+        ? "Land · Even"
+        : `Land · ${landFaction === "blue" ? "Blue" : "Red"} +${Math.abs(point.landMovement).toFixed(3)}%`;
       tooltip.append(land);
     }
     if (showCities && point.cityMovement !== null) {
@@ -3282,43 +3282,25 @@ function renderChartPointTooltip(point) {
       const cityFaction = point.cityMovement > 0 ? "blue" : point.cityMovement < 0 ? "red" : null;
       cities.className = `tt-cities${cityFaction ? ` tt-${cityFaction}` : ""}`;
       cities.textContent = Math.abs(point.cityMovement) < 0.0005
-        ? "Cities · No net movement"
+        ? "Cities · Even"
         : `Cities · ${cityFaction === "blue" ? "Blue" : "Red"} +${Math.abs(point.cityMovement).toFixed(1)}%`;
       tooltip.append(cities);
     }
-    const control = document.createElement("div");
-    control.className = "tt-time";
-    control.textContent = !showLand && point.cityShare !== null
-      ? `Current cities · R ${point.cityRed} / B ${point.cityBlue}`
-      : `Current land · R ${point.share.toFixed(2)}% / B ${(100 - point.share).toFixed(2)}%`;
-    tooltip.append(control);
-    const hint = document.createElement("div");
-    hint.className = "tt-change";
-    hint.textContent = "Press and drag to compare snapshots";
-    tooltip.append(hint);
     positionChartTooltip(point.x);
     return;
   }
   tooltip.append(when);
   if (showLand) {
-    const red = document.createElement("div");
-    red.className = "tt-red";
-    red.textContent = `Land · Red ${point.share.toFixed(3)}%`;
-    const blue = document.createElement("div");
-    blue.className = "tt-blue";
-    blue.textContent = `Land · Blue ${(100 - point.share).toFixed(3)}%`;
-    tooltip.append(red, blue);
+    const land = document.createElement("div");
+    land.innerHTML = `Land · <span class="tt-red">R ${point.share.toFixed(3)}%</span> · <span class="tt-blue">B ${(100 - point.share).toFixed(3)}%</span>`;
+    tooltip.append(land);
   }
   if (showCities && point.cityShare !== null) {
     const cities = document.createElement("div");
     cities.className = "tt-cities";
-    cities.textContent = `Cities · R ${point.cityRed} (${point.cityShare.toFixed(1)}%) / B ${point.cityBlue} (${(100 - point.cityShare).toFixed(1)}%)`;
+    cities.innerHTML = `Cities · <span class="tt-red">R ${point.cityRed} (${point.cityShare.toFixed(1)}%)</span> · <span class="tt-blue">B ${point.cityBlue} (${(100 - point.cityShare).toFixed(1)}%)</span>`;
     tooltip.append(cities);
   }
-  const hint = document.createElement("div");
-  hint.className = "tt-change";
-  hint.textContent = "Press and drag to compare snapshots";
-  tooltip.append(hint);
   positionChartTooltip(point.x);
 }
 
@@ -3333,21 +3315,22 @@ function changeLine(label, change, gained, unit) {
   const name = faction === "red" ? "Red" : "Blue";
   const count = Math.abs(gained);
   const countUnit = unit === "city" && count !== 1 ? "cities" : unit;
-  line.textContent = `${label} · ${name} +${Math.abs(change).toFixed(2)}% (+${count.toLocaleString()} ${countUnit})`;
+  line.textContent = `${label} · ${name} +${Math.abs(change).toFixed(2)}% · +${count.toLocaleString()} ${countUnit}`;
   return line;
 }
 
 function renderChartDragTooltip(first, second) {
   const [start, end] = first.t <= second.t ? [first, second] : [second, first];
+  if (start.i === end.i) {
+    renderChartPointTooltip(start);
+    return;
+  }
   const tooltip = els.chartTooltip;
   tooltip.replaceChildren();
   const range = document.createElement("div");
   range.className = "tt-time tt-range-time";
-  range.textContent = `${timeFormat.format(new Date(start.t * 1000))} → ${timeFormat.format(new Date(end.t * 1000))}`;
-  const duration = document.createElement("div");
-  duration.className = "tt-duration";
-  duration.textContent = start.i === end.i ? "Drag to another snapshot" : formatChartSpan(end.t - start.t);
-  tooltip.append(range, duration);
+  range.textContent = `${timeFormat.format(new Date(start.t * 1000))} → ${timeFormat.format(new Date(end.t * 1000))} · ${formatChartSpan(end.t - start.t)}`;
+  tooltip.append(range);
   if (chartHit?.series !== "cities") {
     const landChange = end.share - start.share;
     const landGained = landChange >= 0 ? end.red - start.red : end.blue - start.blue;
@@ -3640,6 +3623,10 @@ const LEADERBOARD_DISPLAY_STEP = 10;
 let leaderboardTimelineView = null;
 let leaderboardTimelineDrag = null;
 let leaderboardTimelineSuppressClick = false;
+let leaderboardRosterSelectionDrag = null;
+let leaderboardRosterSuppressClick = false;
+let leaderboardTimelineResizeFrame = null;
+let leaderboardTimelineMeasuredWidth = 0;
 
 function leaderboardMetricLabel(metric) {
   return metric === "elo" ? "ELO" : "World";
@@ -3655,6 +3642,17 @@ function leaderboardTopLabel() {
 
 function leaderboardMovementValue(value, unit = leaderboardValueUnit(state.leaderboards.metric)) {
   return `${value >= 0 ? "Blue" : "Red"} ${leaderboardTopLabel()} total leads by ${Math.abs(Math.round(value)).toLocaleString()} ${unit}`;
+}
+
+function leaderboardTooltipMovementValue(value, unit = leaderboardValueUnit(state.leaderboards.metric)) {
+  return `${value >= 0 ? "Blue" : "Red"} +${Math.abs(Math.round(value)).toLocaleString()} ${unit}`;
+}
+
+function leaderboardTooltipRate(value, unit) {
+  if (Math.abs(value) < 1e-9) return "Even";
+  const faction = value > 1e-9 ? "Blue" : value < -1e-9 ? "Red" : "Even";
+  const amount = Math.abs(value).toFixed(unit === "land" ? 3 : 1);
+  return `${faction} +${amount}${unit === "land" ? " pp/h" : "/h"}`;
 }
 
 function normalizeLeaderboardHistory(rows) {
@@ -3805,6 +3803,14 @@ function leaderboardTimelineStep(span, targetTicks = 6) {
   return factor * magnitude;
 }
 
+function leaderboardCorrelationSummary(value) {
+  if (!Number.isFinite(value)) return "not enough variation";
+  const magnitude = Math.abs(value);
+  const strength = magnitude >= 0.7 ? "strong" : magnitude >= 0.4 ? "moderate" : magnitude >= 0.2 ? "weak" : "little";
+  const direction = value >= 0 ? "aligned" : "inverse";
+  return `${strength} ${direction} correlation · r ${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
+}
+
 function packLeaderboardTimelineLabels(series, yOf, minimum, maximum, gap) {
   const labels = series
     .map((player) => ({ key: player.key, y: yOf(player.value) }))
@@ -3834,16 +3840,45 @@ function packLeaderboardTimelineLabels(series, yOf, minimum, maximum, gap) {
   return new Map(labels.map((label) => [label.key, label.packed]));
 }
 
-function setLeaderboardTimelineHighlight(playerKey) {
+function leaderboardTimelineSelectedPlayers() {
+  if (!(state.leaderboards.selectedPlayers instanceof Set)) state.leaderboards.selectedPlayers = new Set();
+  return state.leaderboards.selectedPlayers;
+}
+
+function setLeaderboardTimelineHighlight(playerKey = null) {
   const svg = els.leaderboardTimeline;
-  const activeKey = playerKey || state.leaderboards.highlightedPlayer;
-  svg.classList.toggle("has-highlight", Boolean(activeKey));
+  const selected = state.leaderboards.timelineView === "movement"
+    ? new Set()
+    : leaderboardTimelineSelectedPlayers();
+  const activeKeys = new Set(selected);
+  if (playerKey) activeKeys.add(playerKey);
+  svg.classList.toggle("has-highlight", activeKeys.size > 0);
   for (const container of [svg, els.leaderboardTimelineRoster]) {
     for (const node of container.querySelectorAll("[data-player-key]")) {
-      const active = Boolean(activeKey) && node.dataset.playerKey === activeKey;
+      const key = node.dataset.playerKey;
+      const active = activeKeys.has(key);
       node.classList.toggle("is-highlighted", active);
+      node.classList.toggle("is-selected", selected.has(key));
+      if (node instanceof HTMLButtonElement) node.setAttribute("aria-pressed", String(selected.has(key)));
     }
   }
+}
+
+function toggleLeaderboardTimelinePlayer(playerKey) {
+  if (!playerKey) return;
+  const selected = leaderboardTimelineSelectedPlayers();
+  setLeaderboardTimelinePlayerSelected(playerKey, !selected.has(playerKey));
+  hideLeaderboardTimelineTooltip();
+  renderLeaderboardTimeline();
+}
+
+function setLeaderboardTimelinePlayerSelected(playerKey, shouldSelect) {
+  if (!playerKey) return false;
+  const selected = leaderboardTimelineSelectedPlayers();
+  const wasSelected = selected.has(playerKey);
+  if (shouldSelect) selected.add(playerKey);
+  else selected.delete(playerKey);
+  return wasSelected !== shouldSelect;
 }
 
 function hideLeaderboardTimelineTooltip() {
@@ -3874,33 +3909,47 @@ function positionLeaderboardTimelineTooltip(capturedAt) {
 
 function showLeaderboardTimelineTooltip(point, series, snapshot) {
   const tooltip = els.leaderboardTimelineTooltip;
+  const head = document.createElement("div");
+  head.className = "leaderboard-tooltip-head";
   const time = document.createElement("div");
   time.className = "tt-time";
   time.textContent = timeFormat.format(new Date(snapshot.capturedAt * 1000));
   const player = document.createElement("div");
   player.className = "leaderboard-tooltip-player";
   player.textContent = series.nickname;
+  head.append(player, time);
   const value = document.createElement("div");
   value.textContent = point
     ? (series.movement
-      ? leaderboardMovementValue(point.value)
-      : `Rank #${point.rank} · ${Math.round(point.value).toLocaleString()} ${leaderboardValueUnit(state.leaderboards.metric)}`)
-    : (series.movement ? "Faction totals unavailable at this snapshot" : `Outside the ${leaderboardTopLabel()} at this snapshot`);
-  const content = [time, player, value];
+      ? leaderboardTooltipMovementValue(point.value)
+      : `#${point.rank} · ${Math.round(point.value).toLocaleString()} ${leaderboardValueUnit(state.leaderboards.metric)}`)
+    : (series.movement ? "Totals unavailable" : `Outside ${leaderboardTopLabel()}`);
+  const content = [head, value];
   if (point) {
     const baseline = series.points.find(Boolean);
     if (baseline) {
       const change = Math.round(point.value - baseline.value);
-      const progress = document.createElement("div");
-      progress.className = `tt-change ${change > 0 ? "leaderboard-progress-up" : change < 0 ? "leaderboard-progress-down" : ""}`;
-      progress.textContent = `Visible-window change: ${change > 0 ? "+" : ""}${change.toLocaleString()}`;
-      content.push(progress);
+      if (change !== 0) {
+        const progress = document.createElement("div");
+        progress.className = `tt-change ${change > 0 ? "leaderboard-progress-up" : "leaderboard-progress-down"}`;
+        progress.textContent = `Window Δ ${change > 0 ? "+" : ""}${change.toLocaleString()}`;
+        content.push(progress);
+      }
+    }
+    if (series.movement) {
+      const momentum = leaderboardTimelineView?.momentumByCapturedAt?.get(snapshot.capturedAt);
+      if (momentum) {
+        const pace = document.createElement("div");
+        pace.className = "leaderboard-tooltip-momentum";
+        const rankingPace = document.createElement("div");
+        rankingPace.textContent = `Ranking pace · ${leaderboardTooltipRate(momentum.rankingRate, "ranking")}`;
+        const landPace = document.createElement("div");
+        landPace.textContent = `Land pace · ${leaderboardTooltipRate(momentum.landRate, "land")}`;
+        pace.append(rankingPace, landPace);
+        content.push(pace);
+      }
     }
   }
-  const hint = document.createElement("div");
-  hint.className = "tt-change";
-  hint.textContent = "Press and drag to compare snapshots";
-  content.push(hint);
   tooltip.replaceChildren(...content);
   tooltip.hidden = false;
   const viewX = leaderboardTimelineView.xOf(snapshot.capturedAt);
@@ -3923,6 +3972,10 @@ function renderLeaderboardTimeline() {
   const metric = state.leaderboards.metric;
   const movementMode = state.leaderboards.timelineView === "movement";
   const limit = state.leaderboards.displayLimit;
+  const rosterScrollTop = els.leaderboardTimelineRoster.scrollTop;
+  // Hiding the roster changes the grid width. Do it before measuring so the
+  // first Movement render fills the card instead of needing a second render.
+  els.leaderboardTimelineRoster.hidden = movementMode;
   const currentPlayers = state.leaderboards[metric].slice(0, limit);
   const snapshots = rowsForTimeRange(
     currentLeaderboardHistory(),
@@ -3946,12 +3999,12 @@ function renderLeaderboardTimeline() {
   const xOf = (capturedAt) => plotLeft + ((capturedAt - xStart) / xSpan) * (plotRight - plotLeft);
 
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.style.height = `${height}px`;
   svg.setAttribute("aria-label", movementMode
-    ? `Top ${limit} ${leaderboardMetricLabel(metric)} faction advantage over time with war land momentum`
+    ? `Top ${limit} ${leaderboardMetricLabel(metric)} faction advantage and war land momentum over time`
     : `Top ${limit} ${leaderboardMetricLabel(metric)} value history`);
   svg.replaceChildren();
   els.leaderboardTimelineRoster.replaceChildren();
-  els.leaderboardTimelineRoster.hidden = movementMode;
   leaderboardTimelineView = null;
   leaderboardTimelineDrag = null;
 
@@ -3959,7 +4012,7 @@ function renderLeaderboardTimeline() {
   title.textContent = `${leaderboardMetricLabel(metric)} ${movementMode ? "faction advantage" : "player value momentum"}`;
   const description = svgEl("desc", {});
   description.textContent = movementMode
-    ? `One slope-colored line shows combined Blue ${leaderboardValueUnit(metric)} minus combined Red ${leaderboardValueUnit(metric)} within each snapshot’s actual top ${limit}: up is Blue and down is Red. The dotted, slope-colored war land line uses an independent percentage scale.`
+    ? `Two overlaid lines compare combined Blue-minus-Red ${leaderboardValueUnit(metric)} and independently scaled dotted war land advantage: up is Blue and down is Red.`
     : `Lines show every player who appeared in the visible top-${limit} history. Latest labels remain limited to the current top ${limit}; gaps mean the player was outside the top ${limit}.`;
   svg.append(title, description);
 
@@ -4070,7 +4123,8 @@ function renderLeaderboardTimeline() {
     } else series = [];
   }
 
-  const historicalValues = series.flatMap((player) => player.points.filter(Boolean).map((point) => point.value));
+  const extent = RankingMomentum.valueExtent(series, movementMode ? new Set() : leaderboardTimelineSelectedPlayers());
+  const historicalValues = extent.values;
   if (historicalValues.length === 0) {
     const empty = svgEl("text", { x: width / 2, y: height / 2, "text-anchor": "middle", class: "leaderboard-graph-empty" });
     empty.textContent = movementMode
@@ -4152,10 +4206,12 @@ function renderLeaderboardTimeline() {
     ? (metric === "elo" ? `TOP-${limit} ELO DIFFERENCE` : `TOP-${limit} NET-WIN DIFFERENCE`)
     : (metric === "elo" ? "ELO" : "NET WINS");
   svg.append(valueHeading);
-  let timelineDefs = null;
+  const timelineDefs = svgEl("defs", {});
+  const plotClip = svgEl("clipPath", { id: "leaderboard-timeline-plot-clip" });
+  plotClip.append(svgEl("rect", { x: plotLeft, y: top, width: plotRight - plotLeft, height: plotHeight }));
+  timelineDefs.append(plotClip);
   if (movementMode) {
     const samples = series[0].points.filter(Boolean);
-    timelineDefs = svgEl("defs", {});
     timelineDefs.append(leaderboardTimelineSlopeGradient(
       "leaderboard-movement-slope-gradient",
       samples,
@@ -4164,8 +4220,8 @@ function renderLeaderboardTimeline() {
       plotLeft,
       plotRight,
     ));
-    svg.append(timelineDefs);
   }
+  svg.append(timelineDefs);
 
   for (const player of series) {
     const path = leaderboardTimelinePath(player.points, xOf, yOf);
@@ -4174,6 +4230,7 @@ function renderLeaderboardTimeline() {
         d: path,
         class: `leaderboard-timeline-line ${player.faction}${Number.isFinite(player.rank) && player.rank <= 3 ? " podium" : ""}`,
         "data-player-key": player.key,
+        "clip-path": "url(#leaderboard-timeline-plot-clip)",
       });
       const lineTitle = svgEl("title", {});
       lineTitle.textContent = player.movement
@@ -4186,6 +4243,7 @@ function renderLeaderboardTimeline() {
     }
   }
 
+  let movementComparison = null;
   if (movementMode) {
     const warLandPoints = state.rows
       .map((row) => {
@@ -4216,19 +4274,29 @@ function renderLeaderboardTimeline() {
       warMaximum += warPadding;
       const warYOf = (value) => top + ((warMaximum - value) / (warMaximum - warMinimum)) * plotHeight;
       const warPath = leaderboardTimelinePath(warLandPoints, xOf, warYOf);
-      const warLine = svgEl("path", { d: warPath, class: "leaderboard-timeline-war-line" });
+      const warLine = svgEl("path", {
+        d: warPath,
+        class: "leaderboard-timeline-war-line",
+        "clip-path": "url(#leaderboard-timeline-plot-clip)",
+      });
       const warTitle = svgEl("title", {});
       warTitle.textContent = "War land momentum · independently scaled land-control advantage";
       warLine.append(warTitle);
       const warLabel = svgEl("text", {
         x: plotRight - 6,
-        y: 18,
+        y: 32,
         "text-anchor": "end",
         class: "leaderboard-timeline-war-label",
       });
-      warLabel.textContent = "WAR LAND · INDEPENDENT SCALE";
+      warLabel.textContent = "DOTTED · WAR LAND · INDEPENDENT SCALE";
       svg.append(warLine, warLabel);
     }
+
+    movementComparison = RankingMomentum.rollingComparison(
+      series[0]?.points.filter(Boolean) || [],
+      warLandPoints,
+      6,
+    );
   }
 
   const lastX = xOf(xEnd);
@@ -4238,6 +4306,7 @@ function renderLeaderboardTimeline() {
     rosterPlayer.type = "button";
     rosterPlayer.className = `leaderboard-roster-player ${player.faction}`;
     rosterPlayer.dataset.playerKey = player.key;
+    rosterPlayer.setAttribute("aria-pressed", String(leaderboardTimelineSelectedPlayers().has(player.key)));
     rosterPlayer.setAttribute("aria-label", `${player.nickname}, rank ${player.rank}, ${Math.round(player.value).toLocaleString()} ${leaderboardValueUnit(metric)}`);
     const rank = document.createElement("span");
     rank.className = "leaderboard-roster-rank";
@@ -4251,6 +4320,7 @@ function renderLeaderboardTimeline() {
     rosterPlayer.append(rank, name, value);
     els.leaderboardTimelineRoster.append(rosterPlayer);
   }
+  els.leaderboardTimelineRoster.scrollTop = rosterScrollTop;
   const labelPositions = packLeaderboardTimelineLabels(labelSeries, yOf, top, height - bottom, 25);
   const deltaLabels = new Map();
   for (const player of labelSeries) {
@@ -4262,6 +4332,7 @@ function renderLeaderboardTimeline() {
       r: Number.isFinite(player.rank) && player.rank <= 3 ? 4.8 : 4.2,
       class: `leaderboard-timeline-end-dot ${player.faction}`,
       "data-player-key": player.key,
+      "clip-path": "url(#leaderboard-timeline-plot-clip)",
     });
     if (player.rank === 1) {
       svg.append(svgEl("circle", {
@@ -4270,6 +4341,7 @@ function renderLeaderboardTimeline() {
         r: 9,
         class: `leaderboard-timeline-live-ring ${player.faction}`,
         "data-player-key": player.key,
+        "clip-path": "url(#leaderboard-timeline-plot-clip)",
       }));
     }
     const link = svgEl("a", {
@@ -4388,6 +4460,8 @@ function renderLeaderboardTimeline() {
     yOf,
     snapshots: snapshotLookups,
     series,
+    movementComparison,
+    momentumByCapturedAt: new Map((movementComparison?.samples || []).map((sample) => [sample.capturedAt, sample])),
     deltaLabels,
     dragRange,
     dragStartLine,
@@ -4401,9 +4475,13 @@ function renderLeaderboardTimeline() {
   const rangeEnd = new Date(xEnd * 1000);
   const rangeFormat = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
   if (movementMode) {
-    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · combined Blue minus combined Red within each snapshot’s top ${limit}: up is Blue, down is Red; dotted war land uses the same direction colors on an independent scale.`;
+    const correlation = leaderboardCorrelationSummary(movementComparison?.correlation);
+    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · ranking advantage and dotted land advantage share one plot (${correlation} with rolling land pace). Correlation describes alignment, not causation.`;
   } else {
-    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · ${playerSeries.length.toLocaleString()} players who reached the top ${limit}; gaps mean outside it.`;
+    const selectionNote = extent.fittedToSelection
+      ? ` · Y-axis fitted to ${extent.selectedCount} selected player${extent.selectedCount === 1 ? "" : "s"}`
+      : "";
+    els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · ${playerSeries.length.toLocaleString()} players who reached the top ${limit}${selectionNote}; gaps mean outside it. Click or drag across players to select; start on a selected player to erase.`;
   }
   els.leaderboardTimelineStatus.textContent = state.leaderboards.historyError
     ? "Update failed · showing saved history"
@@ -4430,15 +4508,18 @@ function leaderboardTimelineContextFromEvent(event, preferredPlayerKey = null) {
     }
   }
 
+  const selectedPlayers = leaderboardTimelineSelectedPlayers();
   const focusedKey = preferredPlayerKey
-    || state.leaderboards.highlightedPlayer
-    || target?.dataset.playerKey;
+    || target?.dataset.playerKey
+    || (selectedPlayers.size === 1 ? [...selectedPlayers][0] : null);
   let focusedSeries = focusedKey
     ? view.series.find((player) => player.key === focusedKey)
     : null;
   if (!focusedSeries) {
     let closestDistance = Infinity;
-    for (const player of view.series) {
+    const selectedCandidates = view.series.filter((player) => selectedPlayers.has(player.key));
+    const candidates = selectedCandidates.length > 0 ? selectedCandidates : view.series;
+    for (const player of candidates) {
       const point = snapshot.players.get(player.key);
       if (!point) continue;
       const distance = Math.abs(view.yOf(point.value) - y);
@@ -4465,58 +4546,41 @@ function renderLeaderboardTimelineDragTooltip(series, firstSnapshot, secondSnaps
     : [secondSnapshot, firstSnapshot];
   const startPoint = start.players.get(series.key) || null;
   const endPoint = end.players.get(series.key) || null;
+  if (start === end) {
+    showLeaderboardTimelineTooltip(startPoint, series, start);
+    leaderboardTimelineView?.crosshair.setAttribute("visibility", "hidden");
+    leaderboardTimelineView?.hoverDot.setAttribute("visibility", "hidden");
+    return;
+  }
   const tooltip = els.leaderboardTimelineTooltip;
   const range = document.createElement("div");
   range.className = "tt-time tt-range-time";
-  range.textContent = `${timeFormat.format(new Date(start.capturedAt * 1000))} → ${timeFormat.format(new Date(end.capturedAt * 1000))}`;
-  const duration = document.createElement("div");
-  duration.className = "tt-duration";
-  duration.textContent = start === end ? "Drag to another snapshot" : formatChartSpan(end.capturedAt - start.capturedAt);
+  range.textContent = `${timeFormat.format(new Date(start.capturedAt * 1000))} → ${timeFormat.format(new Date(end.capturedAt * 1000))} · ${formatChartSpan(end.capturedAt - start.capturedAt)}`;
   const player = document.createElement("div");
   player.className = "leaderboard-tooltip-player";
   player.textContent = series.nickname;
   const unit = leaderboardValueUnit(state.leaderboards.metric);
-  const startValue = document.createElement("div");
-  startValue.textContent = startPoint
-    ? (series.movement
-      ? `Start · ${leaderboardMovementValue(startPoint.value, unit)}`
-      : `Start · #${startPoint.rank} · ${Math.round(startPoint.value).toLocaleString()} ${unit}`)
-    : (series.movement ? "Start · Faction totals unavailable" : `Start · Outside the ${leaderboardTopLabel()}`);
-  const endValue = document.createElement("div");
-  endValue.textContent = endPoint
-    ? (series.movement
-      ? `End · ${leaderboardMovementValue(endPoint.value, unit)}`
-      : `End · #${endPoint.rank} · ${Math.round(endPoint.value).toLocaleString()} ${unit}`)
-    : (series.movement ? "End · Faction totals unavailable" : `End · Outside the ${leaderboardTopLabel()}`);
-  const content = [range, duration, player, startValue, endValue];
+  const pointText = (point) => {
+    if (!point) return series.movement ? "Unavailable" : `Outside ${leaderboardTopLabel()}`;
+    return series.movement
+      ? leaderboardTooltipMovementValue(point.value, unit)
+      : `#${point.rank} ${Math.round(point.value).toLocaleString()}`;
+  };
+  const values = document.createElement("div");
+  values.textContent = `${pointText(startPoint)} → ${pointText(endPoint)}${series.movement ? "" : ` ${unit}`}`;
+  const content = [range, player, values];
 
   if (startPoint && endPoint) {
     const valueChange = Math.round(endPoint.value - startPoint.value);
     const progress = document.createElement("div");
     progress.className = `tt-change-value ${valueChange > 0 ? "leaderboard-progress-up" : valueChange < 0 ? "leaderboard-progress-down" : ""}`;
-    progress.textContent = `Value change · ${valueChange > 0 ? "+" : ""}${valueChange.toLocaleString()}`;
+    const details = [`Δ ${valueChange > 0 ? "+" : ""}${valueChange.toLocaleString()}`];
     content.push(progress);
     if (!series.movement) {
       const rankChange = startPoint.rank - endPoint.rank;
-      const ranking = document.createElement("div");
-      ranking.className = `tt-change ${rankChange > 0 ? "leaderboard-progress-up" : rankChange < 0 ? "leaderboard-progress-down" : ""}`;
-      ranking.textContent = rankChange === 0
-        ? `Rank unchanged · #${endPoint.rank}`
-        : `Rank change · ${rankChange > 0 ? "↑" : "↓"}${Math.abs(rankChange)} (#${startPoint.rank} → #${endPoint.rank})`;
-      content.push(ranking);
+      details.push(rankChange === 0 ? "Rank —" : `Rank ${rankChange > 0 ? "↑" : "↓"}${Math.abs(rankChange)}`);
     }
-  } else if (!startPoint && endPoint) {
-    const progress = document.createElement("div");
-    progress.className = "tt-change leaderboard-progress-up";
-    progress.textContent = series.movement
-      ? "Faction totals became available"
-      : `Entered the ${leaderboardTopLabel()} at #${endPoint.rank}`;
-    content.push(progress);
-  } else if (startPoint && !endPoint) {
-    const progress = document.createElement("div");
-    progress.className = "tt-change leaderboard-progress-down";
-    progress.textContent = series.movement ? "Faction totals became unavailable" : `Exited the ${leaderboardTopLabel()}`;
-    content.push(progress);
+    progress.textContent = details.join(" · ");
   }
 
   tooltip.replaceChildren(...content);
@@ -4641,14 +4705,14 @@ function setupLeaderboardTimelineInteractions() {
     }
     const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
     if (!target) {
-      state.leaderboards.highlightedPlayer = null;
-      setLeaderboardTimelineHighlight();
+      if (leaderboardTimelineSelectedPlayers().size) {
+        leaderboardTimelineSelectedPlayers().clear();
+        renderLeaderboardTimeline();
+      } else setLeaderboardTimelineHighlight();
       return;
     }
     event.preventDefault();
-    const key = target.dataset.playerKey;
-    state.leaderboards.highlightedPlayer = state.leaderboards.highlightedPlayer === key ? null : key;
-    setLeaderboardTimelineHighlight();
+    toggleLeaderboardTimelinePlayer(target.dataset.playerKey);
   });
   svg.addEventListener("focusin", (event) => {
     const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
@@ -4657,17 +4721,67 @@ function setupLeaderboardTimelineInteractions() {
   svg.addEventListener("focusout", () => setTimeout(() => setLeaderboardTimelineHighlight(), 0));
   svg.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
-    state.leaderboards.highlightedPlayer = null;
+    leaderboardTimelineSelectedPlayers().clear();
     hideLeaderboardTimelineTooltip();
-    setLeaderboardTimelineHighlight();
+    renderLeaderboardTimeline();
   });
   roster.addEventListener("click", (event) => {
+    if (leaderboardRosterSuppressClick && event.detail !== 0) {
+      event.preventDefault();
+      leaderboardRosterSuppressClick = false;
+      return;
+    }
     const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
     if (!target) return;
-    const key = target.dataset.playerKey;
-    state.leaderboards.highlightedPlayer = state.leaderboards.highlightedPlayer === key ? null : key;
-    setLeaderboardTimelineHighlight();
+    toggleLeaderboardTimelinePlayer(target.dataset.playerKey);
   });
+  const applyRosterDragTarget = (target) => {
+    const drag = leaderboardRosterSelectionDrag;
+    if (!drag || !(target instanceof Element) || !roster.contains(target)) return;
+    const player = target.closest("[data-player-key]");
+    const key = player?.dataset.playerKey;
+    if (!key || drag.visited.has(key)) return;
+    drag.visited.add(key);
+    if (setLeaderboardTimelinePlayerSelected(key, drag.selecting)) drag.changed = true;
+    setLeaderboardTimelineHighlight(key);
+  };
+  const finishRosterSelectionDrag = (event) => {
+    const drag = leaderboardRosterSelectionDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    leaderboardRosterSelectionDrag = null;
+    roster.classList.remove("is-drag-selecting");
+    if (roster.hasPointerCapture(drag.pointerId)) roster.releasePointerCapture(drag.pointerId);
+    leaderboardRosterSuppressClick = event.type !== "pointercancel";
+    setTimeout(() => { leaderboardRosterSuppressClick = false; }, 0);
+    if (drag.changed) {
+      hideLeaderboardTimelineTooltip();
+      renderLeaderboardTimeline();
+    } else setLeaderboardTimelineHighlight();
+    event.preventDefault();
+  };
+  roster.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || leaderboardRosterSelectionDrag) return;
+    const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
+    const key = target?.dataset.playerKey;
+    if (!key) return;
+    leaderboardRosterSelectionDrag = {
+      pointerId: event.pointerId,
+      selecting: !leaderboardTimelineSelectedPlayers().has(key),
+      visited: new Set(),
+      changed: false,
+    };
+    roster.classList.add("is-drag-selecting");
+    roster.setPointerCapture(event.pointerId);
+    applyRosterDragTarget(target);
+    event.preventDefault();
+  });
+  roster.addEventListener("pointermove", (event) => {
+    if (!leaderboardRosterSelectionDrag || event.pointerId !== leaderboardRosterSelectionDrag.pointerId) return;
+    applyRosterDragTarget(document.elementFromPoint(event.clientX, event.clientY));
+    event.preventDefault();
+  });
+  roster.addEventListener("pointerup", finishRosterSelectionDrag);
+  roster.addEventListener("pointercancel", finishRosterSelectionDrag);
   roster.addEventListener("pointerover", (event) => {
     const target = event.target instanceof Element ? event.target.closest("[data-player-key]") : null;
     if (target) setLeaderboardTimelineHighlight(target.dataset.playerKey);
@@ -4678,6 +4792,16 @@ function setupLeaderboardTimelineInteractions() {
     if (target) setLeaderboardTimelineHighlight(target.dataset.playerKey);
   });
   roster.addEventListener("focusout", () => setTimeout(() => setLeaderboardTimelineHighlight(), 0));
+  new ResizeObserver(() => {
+    const width = Math.round(els.leaderboardTimelineWrap.clientWidth);
+    if (!width || width === leaderboardTimelineMeasuredWidth) return;
+    leaderboardTimelineMeasuredWidth = width;
+    if (leaderboardTimelineResizeFrame !== null) cancelAnimationFrame(leaderboardTimelineResizeFrame);
+    leaderboardTimelineResizeFrame = requestAnimationFrame(() => {
+      leaderboardTimelineResizeFrame = null;
+      renderLeaderboardTimeline();
+    });
+  }).observe(els.leaderboardTimelineWrap);
 }
 
 function updateLeaderboardTimelineControls() {
@@ -4703,7 +4827,6 @@ function setupLeaderboards() {
     els.leaderboardLimitSlider.setAttribute("aria-valuetext", `Top ${limit}`);
     els.leaderboardLimitOutput.value = `Top ${limit}`;
     els.leaderboardLimitOutput.textContent = `Top ${limit}`;
-    state.leaderboards.highlightedPlayer = null;
     hideLeaderboardTimelineTooltip();
     renderLeaderboardGraph();
     renderLeaderboardTimeline();
@@ -4715,7 +4838,6 @@ function setupLeaderboards() {
       const range = button.dataset.leaderboardTimelineRange;
       if (!["24h", "1w", "all"].includes(range)) return;
       state.leaderboards.timelineRange = range;
-      state.leaderboards.highlightedPlayer = null;
       hideLeaderboardTimelineTooltip();
       updateLeaderboardTimelineControls();
       renderLeaderboardTimeline();
@@ -4726,7 +4848,6 @@ function setupLeaderboards() {
       const metric = button.dataset.leaderboardMetric;
       if (metric !== "elo" && metric !== "world") return;
       state.leaderboards.metric = metric;
-      state.leaderboards.highlightedPlayer = null;
       for (const option of els.leaderboardMetricButtons) {
         const active = option.dataset.leaderboardMetric === metric;
         option.classList.toggle("is-active", active);
@@ -4742,7 +4863,6 @@ function setupLeaderboards() {
       const view = button.dataset.leaderboardTimelineView;
       if (view !== "movement" && view !== "players") return;
       state.leaderboards.timelineView = view;
-      state.leaderboards.highlightedPlayer = null;
       hideLeaderboardTimelineTooltip();
       updateLeaderboardTimelineControls();
       renderLeaderboardTimeline();

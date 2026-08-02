@@ -9,6 +9,7 @@ The site starts behind an access-code screen. The code is verified only by the W
 ## Structure
 
 - `index.html`, `styles.css`, `app.js` — the app shell, presentation, and interactions
+- `ranking-momentum.js` — tested player comparison scaling and rolling land/ranking correlation helpers
 - `objective-simulator.js` — simultaneous objective-directed 48-hour simulation model
 - `assets/world_map.png` — terrain image (1920×1080)
 - `assets/playable-mask.bitset.zlib` + `assets/playable-mask.meta.json` — static playable-area bitset used to decode `playable-bitset-zlib-v1` snapshots

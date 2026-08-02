@@ -1302,37 +1302,29 @@ input[type="range"]::-moz-range-thumb {
   position: absolute;
   top: 8px;
   pointer-events: none;
-  background: rgba(255, 253, 246, 0.96);
-  border: 2px solid var(--line);
-  border-radius: 10px;
-  padding: 6px 10px;
-  font-size: 0.78rem;
+  max-width: 320px;
+  background: rgba(255, 253, 246, 0.97);
+  border: 1px solid rgba(43, 42, 51, 0.78);
+  border-radius: 7px;
+  padding: 4px 7px;
+  font-size: 0.69rem;
   font-weight: 700;
-  line-height: 1.4;
-  box-shadow: var(--shadow);
+  line-height: 1.25;
+  box-shadow: 2px 2px 0 rgba(43, 42, 51, 0.12);
   white-space: nowrap;
   z-index: 2;
 }
 
-.chart-tooltip .tt-time { color: var(--ink-soft); font-size: 0.72rem; }
+.chart-tooltip .tt-time { color: var(--ink-soft); font-size: 0.62rem; font-weight: 800; }
 .chart-tooltip .tt-red { color: var(--red-deep); }
 .chart-tooltip .tt-blue { color: var(--blue-deep); }
-.chart-tooltip .tt-cities { margin-top: 3px; padding-top: 3px; border-top: 1px solid rgba(43, 42, 51, 0.2); }
+.chart-tooltip .tt-cities { margin-top: 1px; }
 .chart-tooltip .tt-change {
-  margin-top: 4px;
-  padding-top: 4px;
-  border-top: 1px solid rgba(43, 42, 51, 0.2);
+  margin-top: 1px;
   font-weight: 800;
 }
 
-.chart-tooltip .tt-range-time { max-width: 310px; white-space: normal; }
-.chart-tooltip .tt-duration {
-  margin: 2px 0 4px;
-  padding-bottom: 4px;
-  border-bottom: 1px solid rgba(43, 42, 51, 0.2);
-  color: var(--ink-soft);
-  font-size: 0.72rem;
-}
+.chart-tooltip .tt-range-time { max-width: 290px; white-space: normal; }
 .chart-tooltip .tt-change-value { font-weight: 800; }
 
 /* Snapshot log */
@@ -1731,7 +1723,11 @@ th[aria-sort="ascending"] .island-sort-button.is-active::after { content: "↑";
   border: 1px solid rgba(43, 42, 51, 0.2);
   border-radius: 10px;
   background: rgba(43, 42, 51, 0.035);
+  touch-action: pan-y;
 }
+
+.leaderboard-timeline-roster.is-drag-selecting,
+.leaderboard-timeline-roster.is-drag-selecting * { cursor: crosshair; }
 
 .leaderboard-timeline-roster[hidden] { display: none; }
 .leaderboard-timeline-roster[hidden] + .leaderboard-timeline-wrap { grid-column: 1 / -1; }
@@ -1758,6 +1754,11 @@ th[aria-sort="ascending"] .island-sort-button.is-active::after { content: "↑";
 .leaderboard-roster-player.is-highlighted {
   background: rgba(240, 169, 46, 0.16);
   outline: none;
+}
+
+.leaderboard-roster-player.is-selected {
+  background: rgba(240, 169, 46, 0.22);
+  box-shadow: inset 3px 0 0 var(--gold);
 }
 
 .leaderboard-roster-rank,
@@ -1955,6 +1956,12 @@ th[aria-sort="ascending"] .island-sort-button.is-active::after { content: "↑";
 
 .leaderboard-timeline-end-dot.is-highlighted { opacity: 1; }
 
+.leaderboard-tooltip-momentum {
+  margin-top: 2px;
+  padding-top: 2px;
+  border-top: 1px solid rgba(43, 42, 51, 0.12);
+}
+
 .leaderboard-timeline-delta {
   fill: var(--ink);
   font: 1000 13px var(--font-body);
@@ -1968,8 +1975,14 @@ th[aria-sort="ascending"] .island-sort-button.is-active::after { content: "↑";
 .leaderboard-timeline-label-link,
 .leaderboard-timeline-delta { display: none; }
 
-.leaderboard-timeline-tooltip { top: 28px; }
-.leaderboard-tooltip-player { font-weight: 900; }
+.leaderboard-timeline-tooltip { top: 16px; }
+.leaderboard-tooltip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.leaderboard-tooltip-player { overflow: hidden; font-weight: 900; text-overflow: ellipsis; }
 .leaderboard-progress-up { color: var(--blue-deep); }
 .leaderboard-progress-down { color: var(--red-deep); }
 
