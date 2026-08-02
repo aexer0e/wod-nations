@@ -22,6 +22,9 @@ const SESSION_KEY = "wod-nations-access-session";
 const HISTORY_DB_NAME = "wod-nations-history";
 const HISTORY_DB_VERSION = 1;
 const HISTORY_STORE = "snapshots";
+// Production push that introduced the Nations economy update.
+const ECONOMY_UPDATE_AT = Date.parse("2026-08-01T21:00:00Z") / 1000;
+const ECONOMY_UPDATE_LABEL = "Economy update";
 
 if (IS_IOS) document.documentElement.classList.add("ios");
 if (MEMORY_CONSTRAINED) document.documentElement.classList.add("memory-constrained");
@@ -2666,6 +2669,66 @@ function svgEl(name, attrs) {
   return el;
 }
 
+function appendTimelineEventMarker(svg, {
+  capturedAt,
+  label,
+  xStart,
+  xEnd,
+  xOf,
+  plotTop,
+  plotBottom,
+  labelLeft,
+  labelRight,
+}) {
+  if (capturedAt < xStart || capturedAt > xEnd) return;
+  const x = xOf(capturedAt);
+  const labelWidth = 108;
+  const labelHeight = 18;
+  const labelX = Math.max(
+    labelLeft,
+    Math.min(labelRight - labelWidth, x - labelWidth / 2),
+  );
+  const labelY = plotTop - labelHeight - 7;
+  const pushedAt = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(capturedAt * 1000));
+  const group = svgEl("g", {
+    class: "timeline-event-marker",
+    role: "note",
+    "aria-label": `${label} pushed ${pushedAt}`,
+  });
+  const title = svgEl("title", {});
+  title.textContent = `${label} pushed ${pushedAt}`;
+  const text = svgEl("text", {
+    x: labelX + labelWidth / 2,
+    y: labelY + 12.5,
+    "text-anchor": "middle",
+    class: "timeline-event-label",
+  });
+  text.textContent = label;
+  group.append(
+    title,
+    svgEl("line", {
+      x1: x,
+      x2: x,
+      y1: plotTop,
+      y2: plotBottom,
+      class: "timeline-event-line",
+    }),
+    svgEl("rect", {
+      x: labelX,
+      y: labelY,
+      width: labelWidth,
+      height: labelHeight,
+      rx: 5,
+      class: "timeline-event-label-bg",
+    }),
+    text,
+  );
+  svg.append(group);
+}
+
 function formatChartSpan(seconds) {
   const hours = seconds / 3600;
   if (hours >= 48 && Math.abs(hours / 24 - Math.round(hours / 24)) < 0.08) {
@@ -2815,8 +2878,10 @@ function renderChart() {
       : null;
   }
 
+  const economyUpdateVisible = ECONOMY_UPDATE_AT >= points[0].t
+    && ECONOMY_UPDATE_AT <= points[points.length - 1].t;
   const pad = {
-    top: 32,
+    top: economyUpdateVisible ? 58 : 32,
     right: movementMode ? 118 : 66,
     bottom: 26,
     left: width < 420 ? 44 : 56,
@@ -2968,6 +3033,18 @@ function renderChart() {
     }));
     dayCursor.setDate(dayCursor.getDate() + 1);
   }
+
+  appendTimelineEventMarker(svg, {
+    capturedAt: ECONOMY_UPDATE_AT,
+    label: ECONOMY_UPDATE_LABEL,
+    xStart: t0,
+    xEnd: t1,
+    xOf,
+    plotTop: pad.top,
+    plotBottom: pad.top + plotH,
+    labelLeft: 4,
+    labelRight: width - 4,
+  });
 
   // Gridlines with a step that yields a handful of lines.
   let step = 20;
@@ -3289,6 +3366,7 @@ function renderChartPointTooltip(point) {
     positionChartTooltip(point.x);
     return;
   }
+
   tooltip.append(when);
   if (showLand) {
     const land = document.createElement("div");
@@ -3985,7 +4063,11 @@ function renderLeaderboardTimeline() {
   const svg = els.leaderboardTimeline;
   const width = Math.max(760, Math.round(els.leaderboardTimelineWrap.clientWidth || 1200));
   const height = 650;
-  const top = 38;
+  const historyStart = snapshots[0]?.capturedAt ?? 0;
+  const historyEnd = snapshots.at(-1)?.capturedAt ?? historyStart + 1;
+  const economyUpdateVisible = ECONOMY_UPDATE_AT >= historyStart
+    && ECONOMY_UPDATE_AT <= historyEnd;
+  const top = economyUpdateVisible ? 64 : 38;
   const bottom = 54;
   const plotLeft = 54;
   const plotRight = width - 28;
@@ -3993,8 +4075,8 @@ function renderLeaderboardTimeline() {
   const labelValueX = 1180;
   const labelDeltaX = labelValueX - 64;
   const plotHeight = height - top - bottom;
-  const xStart = snapshots[0]?.capturedAt ?? 0;
-  const xEnd = snapshots.at(-1)?.capturedAt ?? xStart + 1;
+  const xStart = historyStart;
+  const xEnd = historyEnd;
   const xSpan = Math.max(1, xEnd - xStart);
   const xOf = (capturedAt) => plotLeft + ((capturedAt - xStart) / xSpan) * (plotRight - plotLeft);
 
@@ -4174,6 +4256,18 @@ function renderLeaderboardTimeline() {
     valueLabel.textContent = `${movementMode && value > 0 ? "+" : ""}${Math.round(value).toLocaleString()}`;
     svg.append(valueLabel);
   }
+
+  appendTimelineEventMarker(svg, {
+    capturedAt: ECONOMY_UPDATE_AT,
+    label: ECONOMY_UPDATE_LABEL,
+    xStart,
+    xEnd,
+    xOf,
+    plotTop: top,
+    plotBottom: top + plotHeight,
+    labelLeft: 4,
+    labelRight: width - 4,
+  });
 
   if (movementMode) {
     const zeroY = yOf(0);

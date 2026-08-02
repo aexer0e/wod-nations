@@ -1220,6 +1220,25 @@ input[type="range"]::-moz-range-thumb {
   stroke-width: 0.8px;
   pointer-events: none;
 }
+.timeline-event-marker { pointer-events: none; }
+.timeline-event-line {
+  stroke: #8d5b06;
+  stroke-width: 2px;
+  stroke-dasharray: 5 4;
+  vector-effect: non-scaling-stroke;
+}
+.timeline-event-label-bg {
+  fill: #fff8df;
+  stroke: rgba(141, 91, 6, 0.58);
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+}
+.timeline-event-label {
+  fill: #704703;
+  font: 900 10px var(--font-body);
+  letter-spacing: 0.35px;
+  text-transform: uppercase;
+}
 .chart-direction-label {
   font: 900 10px var(--font-body);
   letter-spacing: 0.8px;
