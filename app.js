@@ -157,6 +157,7 @@ const state = {
     fetchedAt: null,
     history: [],
     historyFetchedAt: null,
+    historyLimit: 0,
     historyError: null,
     metric: "world",
     displayLimit: 20,
@@ -3701,6 +3702,7 @@ const LEADERBOARD_DISPLAY_STEP = 10;
 let leaderboardTimelineView = null;
 let leaderboardTimelineDrag = null;
 let leaderboardTimelineSuppressClick = false;
+let leaderboardHistoryRefreshTimer = null;
 let leaderboardRosterSelectionDrag = null;
 let leaderboardRosterSuppressClick = false;
 let leaderboardTimelineResizeFrame = null;
@@ -4924,6 +4926,13 @@ function setupLeaderboards() {
     hideLeaderboardTimelineTooltip();
     renderLeaderboardGraph();
     renderLeaderboardTimeline();
+    if (state.leaderboards.fetchedAt && limit > state.leaderboards.historyLimit) {
+      if (leaderboardHistoryRefreshTimer !== null) clearTimeout(leaderboardHistoryRefreshTimer);
+      leaderboardHistoryRefreshTimer = setTimeout(() => {
+        leaderboardHistoryRefreshTimer = null;
+        void refreshLeaderboardHistory(limit);
+      }, 350);
+    }
   };
   els.leaderboardLimitSlider.addEventListener("input", () => setDisplayLimit(els.leaderboardLimitSlider.value));
   setDisplayLimit(state.leaderboards.displayLimit);
@@ -4968,12 +4977,37 @@ function setupLeaderboards() {
   renderLeaderboardTimeline();
 }
 
+function applyLeaderboardHistory(data, requestedTop) {
+  state.leaderboards.history = normalizeLeaderboardHistory(data.rows);
+  state.leaderboards.historyFetchedAt = state.leaderboards.history.at(-1)?.capturedAt ?? null;
+  state.leaderboards.historyLimit = Math.max(Number(data.top) || requestedTop, 0);
+  state.leaderboards.historyError = null;
+  if (!state.leaderboards.fetchedAt && state.leaderboards.history.length) {
+    const latest = state.leaderboards.history.at(-1);
+    state.leaderboards.elo = latest.elo;
+    state.leaderboards.world = latest.world;
+    state.leaderboards.fetchedAt = latest.capturedAt;
+  }
+}
+
+async function refreshLeaderboardHistory(top = state.leaderboards.displayLimit) {
+  const requestedTop = Math.max(LEADERBOARD_DISPLAY_MINIMUM, Math.min(LEADERBOARD_DISPLAY_MAXIMUM, top));
+  try {
+    const data = await fetchJSON(`${API}/v1/leaderboard/history?limit=${LEADERBOARD_HISTORY_LIMIT}&top=${requestedTop}`);
+    applyLeaderboardHistory(data, requestedTop);
+  } catch (error) {
+    state.leaderboards.historyError = error.message || "Could not load leaderboard history.";
+  }
+  renderLeaderboardTimeline();
+}
+
 async function refreshLeaderboards() {
   els.leaderboardsSection.setAttribute("aria-busy", "true");
   els.leaderboardStatus.textContent = state.leaderboards.fetchedAt ? "Refreshing rankings…" : "Loading live rankings…";
+  const requestedTop = state.leaderboards.displayLimit;
   const [currentResult, historyResult] = await Promise.allSettled([
     fetchJSON(`${API}/v1/leaderboard`),
-    fetchJSON(`${API}/v1/leaderboard/history?limit=${LEADERBOARD_HISTORY_LIMIT}`),
+    fetchJSON(`${API}/v1/leaderboard/history?limit=${LEADERBOARD_HISTORY_LIMIT}&top=${requestedTop}`),
     loadLeaderboardPlayerColors(),
   ]);
 
@@ -4993,15 +5027,7 @@ async function refreshLeaderboards() {
 
   if (historyResult.status === "fulfilled") {
     try {
-      state.leaderboards.history = normalizeLeaderboardHistory(historyResult.value.rows);
-      state.leaderboards.historyFetchedAt = state.leaderboards.history.at(-1)?.capturedAt ?? null;
-      state.leaderboards.historyError = null;
-      if (!state.leaderboards.fetchedAt && state.leaderboards.history.length) {
-        const latest = state.leaderboards.history.at(-1);
-        state.leaderboards.elo = latest.elo;
-        state.leaderboards.world = latest.world;
-        state.leaderboards.fetchedAt = latest.capturedAt;
-      }
+      applyLeaderboardHistory(historyResult.value, requestedTop);
     } catch (error) {
       state.leaderboards.historyError = error.message || "Invalid leaderboard history.";
     }
