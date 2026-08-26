@@ -20,8 +20,12 @@ const POLL_MS = 5 * 60 * 1000;
 const SNAPSHOT_GAP_THRESHOLD_SECONDS = 40 * 60;
 const SESSION_KEY = "wod-nations-access-session";
 const HISTORY_DB_NAME = "wod-nations-history";
-const HISTORY_DB_VERSION = 1;
+const HISTORY_DB_VERSION = 2;
 const HISTORY_STORE = "snapshots";
+const LEADERBOARD_HISTORY_STORE = "leaderboard-history";
+const LEADERBOARD_HISTORY_META_STORE = "leaderboard-history-meta";
+const LEADERBOARD_HISTORY_META_KEY = "complete";
+const LEADERBOARD_HISTORY_RETENTION_SECONDS = 150 * 24 * 3600;
 // Production push that introduced the Nations economy update.
 const ECONOMY_UPDATE_AT = Date.parse("2026-08-01T21:00:00Z") / 1000;
 const ECONOMY_UPDATE_LABEL = "Economy update";
@@ -158,12 +162,14 @@ const state = {
     history: [],
     historyFetchedAt: null,
     historyLimit: 0,
+    historyComplete: false,
+    historyLoadingAll: false,
     historyError: null,
     metric: "world",
     displayLimit: 20,
     selectedPlayers: new Set(),
     timelineView: "players",
-    timelineRange: "all",
+    timelineRange: "1w",
   },
   view: { scale: 1, tx: 0, ty: 0, fit: 1 },
   region: {
@@ -289,6 +295,12 @@ function openHistoryDatabase() {
       if (!database.objectStoreNames.contains(HISTORY_STORE)) {
         database.createObjectStore(HISTORY_STORE, { keyPath: "capturedAt" });
       }
+      if (!database.objectStoreNames.contains(LEADERBOARD_HISTORY_STORE)) {
+        database.createObjectStore(LEADERBOARD_HISTORY_STORE, { keyPath: "capturedAt" });
+      }
+      if (!database.objectStoreNames.contains(LEADERBOARD_HISTORY_META_STORE)) {
+        database.createObjectStore(LEADERBOARD_HISTORY_META_STORE, { keyPath: "key" });
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error("Could not open the history cache."));
@@ -326,6 +338,53 @@ async function cacheTimelineRows(rows, oldestCapturedAt = null) {
     const range = IDBKeyRange.upperBound(oldestCapturedAt, true);
     store.delete(range);
   }
+  await historyTransactionDone(transaction);
+}
+
+function historyRequestResult(request, errorMessage) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error(errorMessage));
+  });
+}
+
+async function readCachedLeaderboardHistory(top) {
+  const database = await openHistoryDatabase();
+  const transaction = database.transaction(
+    [LEADERBOARD_HISTORY_STORE, LEADERBOARD_HISTORY_META_STORE],
+    "readonly",
+  );
+  const rowsRequest = transaction.objectStore(LEADERBOARD_HISTORY_STORE).getAll();
+  const metaRequest = transaction.objectStore(LEADERBOARD_HISTORY_META_STORE).get(LEADERBOARD_HISTORY_META_KEY);
+  const [rows, meta] = await Promise.all([
+    historyRequestResult(rowsRequest, "Could not read cached leaderboard history."),
+    historyRequestResult(metaRequest, "Could not read leaderboard cache metadata."),
+  ]);
+  if (!meta || !meta.complete || Number(meta.top) < top || !Array.isArray(rows)) return null;
+  const cutoff = Math.floor(Date.now() / 1000) - LEADERBOARD_HISTORY_RETENTION_SECONDS;
+  return {
+    rows: rows.filter((row) => Number(row?.capturedAt) >= cutoff),
+    top: Number(meta.top),
+  };
+}
+
+async function cacheCompleteLeaderboardHistory(rows, top, replace) {
+  const database = await openHistoryDatabase();
+  const transaction = database.transaction(
+    [LEADERBOARD_HISTORY_STORE, LEADERBOARD_HISTORY_META_STORE],
+    "readwrite",
+  );
+  const store = transaction.objectStore(LEADERBOARD_HISTORY_STORE);
+  if (replace) store.clear();
+  for (const row of rows) store.put(row);
+  const cutoff = Math.floor(Date.now() / 1000) - LEADERBOARD_HISTORY_RETENTION_SECONDS;
+  store.delete(IDBKeyRange.upperBound(cutoff, true));
+  transaction.objectStore(LEADERBOARD_HISTORY_META_STORE).put({
+    key: LEADERBOARD_HISTORY_META_KEY,
+    complete: true,
+    top,
+    updatedAt: Math.floor(Date.now() / 1000),
+  });
   await historyTransactionDone(transaction);
 }
 
@@ -3707,6 +3766,7 @@ let leaderboardRosterSelectionDrag = null;
 let leaderboardRosterSuppressClick = false;
 let leaderboardTimelineResizeFrame = null;
 let leaderboardTimelineMeasuredWidth = 0;
+let leaderboardHistoryRequestGeneration = 0;
 
 function leaderboardMetricLabel(metric) {
   return metric === "elo" ? "ELO" : "World";
@@ -4579,9 +4639,11 @@ function renderLeaderboardTimeline() {
       : "";
     els.leaderboardTimelineDescription.textContent = `${rangeFormat.format(rangeStart)}–${rangeFormat.format(rangeEnd)} · ${playerSeries.length.toLocaleString()} players who reached the top ${limit}${selectionNote}; gaps mean outside it. Click or drag across players to select; start on a selected player to erase.`;
   }
-  els.leaderboardTimelineStatus.textContent = state.leaderboards.historyError
-    ? "Update failed · showing saved history"
-    : `${snapshots.length.toLocaleString()} snapshots · live`;
+  els.leaderboardTimelineStatus.textContent = state.leaderboards.historyLoadingAll
+    ? `${snapshots.length.toLocaleString()} snapshots · loading older history…`
+    : state.leaderboards.historyError
+      ? "Update failed · showing saved history"
+      : `${snapshots.length.toLocaleString()} snapshots · live`;
   els.leaderboardTimelineStatus.title = state.leaderboards.historyError || "";
 }
 
@@ -4930,7 +4992,7 @@ function setupLeaderboards() {
       if (leaderboardHistoryRefreshTimer !== null) clearTimeout(leaderboardHistoryRefreshTimer);
       leaderboardHistoryRefreshTimer = setTimeout(() => {
         leaderboardHistoryRefreshTimer = null;
-        void refreshLeaderboardHistory(limit);
+        void refreshLeaderboardHistory(limit, state.leaderboards.timelineRange === "all");
       }, 350);
     }
   };
@@ -4944,6 +5006,9 @@ function setupLeaderboards() {
       hideLeaderboardTimelineTooltip();
       updateLeaderboardTimelineControls();
       renderLeaderboardTimeline();
+      if (range === "all" && !state.leaderboards.historyComplete) {
+        void refreshLeaderboardHistory(state.leaderboards.displayLimit, true);
+      }
     });
   }
   for (const button of els.leaderboardMetricButtons) {
@@ -4977,10 +5042,11 @@ function setupLeaderboards() {
   renderLeaderboardTimeline();
 }
 
-function applyLeaderboardHistory(data, requestedTop) {
+function applyLeaderboardHistory(data, requestedTop, complete) {
   state.leaderboards.history = normalizeLeaderboardHistory(data.rows);
   state.leaderboards.historyFetchedAt = state.leaderboards.history.at(-1)?.capturedAt ?? null;
   state.leaderboards.historyLimit = Math.max(Number(data.top) || requestedTop, 0);
+  state.leaderboards.historyComplete = complete;
   state.leaderboards.historyError = null;
   if (!state.leaderboards.fetchedAt && state.leaderboards.history.length) {
     const latest = state.leaderboards.history.at(-1);
@@ -4990,13 +5056,71 @@ function applyLeaderboardHistory(data, requestedTop) {
   }
 }
 
-async function refreshLeaderboardHistory(top = state.leaderboards.displayLimit) {
+async function fetchRecentLeaderboardHistory(top) {
   const requestedTop = Math.max(LEADERBOARD_DISPLAY_MINIMUM, Math.min(LEADERBOARD_DISPLAY_MAXIMUM, top));
+  return fetchJSON(`${API}/v1/leaderboard/history?limit=${LEADERBOARD_HISTORY_LIMIT}&top=${requestedTop}`);
+}
+
+async function fetchCompleteLeaderboardHistory(top) {
+  const requestedTop = Math.max(LEADERBOARD_DISPLAY_MINIMUM, Math.min(LEADERBOARD_DISPLAY_MAXIMUM, top));
+  const canFetchIncrementally = state.leaderboards.historyComplete
+    && state.leaderboards.historyLimit >= requestedTop
+    && Number.isFinite(state.leaderboards.historyFetchedAt);
+  const historyTop = canFetchIncrementally ? state.leaderboards.historyLimit : requestedTop;
+  const from = canFetchIncrementally ? state.leaderboards.historyFetchedAt : 0;
+  const existingRows = canFetchIncrementally ? state.leaderboards.history : [];
+  const existingTop = canFetchIncrementally ? state.leaderboards.historyLimit : 0;
+  const data = await RankingMomentum.collectHistoryPages(async (before) => {
+    const params = new URLSearchParams({
+      from: String(from),
+      limit: String(LEADERBOARD_HISTORY_LIMIT),
+      top: String(historyTop),
+    });
+    if (before !== null) params.set("before", String(before));
+    return fetchJSON(`${API}/v1/leaderboard/history?${params}`);
+  });
+  return {
+    rows: [...existingRows, ...data.rows],
+    top: Math.max(existingTop, data.top || requestedTop),
+    fetchedRows: data.rows,
+    replaceCache: !canFetchIncrementally,
+  };
+}
+
+async function refreshLeaderboardHistory(top = state.leaderboards.displayLimit, loadAll = false) {
+  const requestedTop = Math.max(LEADERBOARD_DISPLAY_MINIMUM, Math.min(LEADERBOARD_DISPLAY_MAXIMUM, top));
+  const generation = ++leaderboardHistoryRequestGeneration;
+  if (loadAll) {
+    state.leaderboards.historyLoadingAll = true;
+    state.leaderboards.historyError = null;
+    renderLeaderboardTimeline();
+  }
   try {
-    const data = await fetchJSON(`${API}/v1/leaderboard/history?limit=${LEADERBOARD_HISTORY_LIMIT}&top=${requestedTop}`);
-    applyLeaderboardHistory(data, requestedTop);
+    if (loadAll && !state.leaderboards.historyComplete) {
+      const cached = await readCachedLeaderboardHistory(requestedTop).catch(() => null);
+      if (generation !== leaderboardHistoryRequestGeneration) return;
+      if (cached) {
+        applyLeaderboardHistory(cached, requestedTop, true);
+        renderLeaderboardTimeline();
+      }
+    }
+    const data = loadAll
+      ? await fetchCompleteLeaderboardHistory(requestedTop)
+      : await fetchRecentLeaderboardHistory(requestedTop);
+    if (generation !== leaderboardHistoryRequestGeneration) return;
+    applyLeaderboardHistory(data, requestedTop, loadAll);
+    if (loadAll) {
+      void cacheCompleteLeaderboardHistory(
+        normalizeLeaderboardHistory(data.fetchedRows),
+        state.leaderboards.historyLimit,
+        data.replaceCache,
+      ).catch(() => {});
+    }
   } catch (error) {
+    if (generation !== leaderboardHistoryRequestGeneration) return;
     state.leaderboards.historyError = error.message || "Could not load leaderboard history.";
+  } finally {
+    if (generation === leaderboardHistoryRequestGeneration) state.leaderboards.historyLoadingAll = false;
   }
   renderLeaderboardTimeline();
 }
@@ -5005,9 +5129,11 @@ async function refreshLeaderboards() {
   els.leaderboardsSection.setAttribute("aria-busy", "true");
   els.leaderboardStatus.textContent = state.leaderboards.fetchedAt ? "Refreshing rankings…" : "Loading live rankings…";
   const requestedTop = state.leaderboards.displayLimit;
+  const historyGeneration = ++leaderboardHistoryRequestGeneration;
+  const loadAll = state.leaderboards.timelineRange === "all";
   const [currentResult, historyResult] = await Promise.allSettled([
     fetchJSON(`${API}/v1/leaderboard`),
-    fetchJSON(`${API}/v1/leaderboard/history?limit=${LEADERBOARD_HISTORY_LIMIT}&top=${requestedTop}`),
+    loadAll ? fetchCompleteLeaderboardHistory(requestedTop) : fetchRecentLeaderboardHistory(requestedTop),
     loadLeaderboardPlayerColors(),
   ]);
 
@@ -5025,9 +5151,18 @@ async function refreshLeaderboards() {
     currentError = currentResult.reason;
   }
 
-  if (historyResult.status === "fulfilled") {
+  if (historyGeneration !== leaderboardHistoryRequestGeneration) {
+    // A newer request (usually a larger Top-N selection) owns history state.
+  } else if (historyResult.status === "fulfilled") {
     try {
-      applyLeaderboardHistory(historyResult.value, requestedTop);
+      applyLeaderboardHistory(historyResult.value, requestedTop, loadAll);
+      if (loadAll) {
+        void cacheCompleteLeaderboardHistory(
+          normalizeLeaderboardHistory(historyResult.value.fetchedRows),
+          state.leaderboards.historyLimit,
+          historyResult.value.replaceCache,
+        ).catch(() => {});
+      }
     } catch (error) {
       state.leaderboards.historyError = error.message || "Invalid leaderboard history.";
     }

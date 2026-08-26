@@ -107,5 +107,24 @@
     };
   }
 
-  return { interpolateValue, pearsonCorrelation, rollingComparison, valueExtent };
+  async function collectHistoryPages(fetchPage) {
+    const rows = [];
+    const seenCursors = new Set();
+    let before = null;
+    let top = 0;
+    while (true) {
+      const page = await fetchPage(before);
+      if (!page || !Array.isArray(page.rows)) throw new Error("Invalid leaderboard history.");
+      rows.push(...page.rows);
+      top = Math.max(top, Number(page.top) || 0);
+      const nextBefore = Number(page.nextBefore);
+      if (!Number.isFinite(nextBefore) || nextBefore <= 0) break;
+      if (seenCursors.has(nextBefore)) throw new Error("Leaderboard history pagination did not advance.");
+      seenCursors.add(nextBefore);
+      before = nextBefore;
+    }
+    return { rows, top };
+  }
+
+  return { collectHistoryPages, interpolateValue, pearsonCorrelation, rollingComparison, valueExtent };
 });
