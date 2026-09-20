@@ -17,6 +17,7 @@ const CACHE_LIMIT = MEMORY_CONSTRAINED ? 2 : 10; // each decoded 1920x1080 canva
 const OWNERSHIP_CACHE_LIMIT = MEMORY_CONSTRAINED ? 2 : 12;
 const EMPTY_FRONTS = new Uint32Array(0);
 const POLL_MS = 5 * 60 * 1000;
+const LEADERBOARD_POLL_MS = 2 * 60 * 1000;
 const SNAPSHOT_GAP_THRESHOLD_SECONDS = 40 * 60;
 const SESSION_KEY = "wod-nations-access-session";
 const HISTORY_DB_NAME = "wod-nations-history";
@@ -264,7 +265,7 @@ function hideAccessGate() {
 async function authenticatedFetch(url, init = {}) {
   const target = new URL(url, location.href);
   const headers = new Headers(init.headers);
-  if (target.origin === new URL(API).origin && accessToken) {
+  if (target.origin === new URL(API).origin && accessToken && !target.pathname.startsWith("/v1/leaderboard")) {
     headers.set("Authorization", `Bearer ${accessToken}`);
   }
   const resp = await fetch(target, { ...init, headers });
@@ -5056,35 +5057,36 @@ function applyLeaderboardHistory(data, requestedTop, complete) {
   }
 }
 
+async function fetchLeaderboardRefresh(top, loadAll = false) {
+  const now = Math.floor(Date.now() / 120000) * 120;
+  const from = loadAll ? 0 : now - 7 * 86400;
+  const canIncrement = state.leaderboards.historyLimit >= top
+    && Number.isFinite(state.leaderboards.historyFetchedAt)
+    && (!loadAll || state.leaderboards.historyComplete);
+  const historyTop = canIncrement ? state.leaderboards.historyLimit : top;
+  const existingRows = canIncrement ? state.leaderboards.history : [];
+  const since = canIncrement ? state.leaderboards.historyFetchedAt : 0;
+  const params = new URLSearchParams({ history: "boards", from: String(from), top: String(historyTop) });
+  if (canIncrement) params.set("since", String(since));
+  const data = await fetchJSON(API + "/v1/leaderboard/refresh?" + params);
+  let first = true;
+  const history = await RankingMomentum.collectHistoryPages(async (before) => {
+    if (first) { first = false; return data.history; }
+    const query = new URLSearchParams({ from: String(canIncrement ? Math.max(from, since) : from),
+      to: String(data.capturedAt + 1), before: String(before), limit: String(LEADERBOARD_HISTORY_LIMIT), top: String(historyTop) });
+    return fetchJSON(API + "/v1/leaderboard/history?" + query);
+  });
+  return { latest: data, rows: normalizeLeaderboardHistory([...existingRows, ...history.rows])
+    .filter(row => row.capturedAt >= Math.max(from, now - LEADERBOARD_HISTORY_RETENTION_SECONDS)),
+    top: historyTop, fetchedRows: history.rows, replaceCache: !canIncrement };
+}
+
 async function fetchRecentLeaderboardHistory(top) {
-  const requestedTop = Math.max(LEADERBOARD_DISPLAY_MINIMUM, Math.min(LEADERBOARD_DISPLAY_MAXIMUM, top));
-  return fetchJSON(`${API}/v1/leaderboard/history?limit=${LEADERBOARD_HISTORY_LIMIT}&top=${requestedTop}`);
+  return fetchLeaderboardRefresh(top, false);
 }
 
 async function fetchCompleteLeaderboardHistory(top) {
-  const requestedTop = Math.max(LEADERBOARD_DISPLAY_MINIMUM, Math.min(LEADERBOARD_DISPLAY_MAXIMUM, top));
-  const canFetchIncrementally = state.leaderboards.historyComplete
-    && state.leaderboards.historyLimit >= requestedTop
-    && Number.isFinite(state.leaderboards.historyFetchedAt);
-  const historyTop = canFetchIncrementally ? state.leaderboards.historyLimit : requestedTop;
-  const from = canFetchIncrementally ? state.leaderboards.historyFetchedAt : 0;
-  const existingRows = canFetchIncrementally ? state.leaderboards.history : [];
-  const existingTop = canFetchIncrementally ? state.leaderboards.historyLimit : 0;
-  const data = await RankingMomentum.collectHistoryPages(async (before) => {
-    const params = new URLSearchParams({
-      from: String(from),
-      limit: String(LEADERBOARD_HISTORY_LIMIT),
-      top: String(historyTop),
-    });
-    if (before !== null) params.set("before", String(before));
-    return fetchJSON(`${API}/v1/leaderboard/history?${params}`);
-  });
-  return {
-    rows: [...existingRows, ...data.rows],
-    top: Math.max(existingTop, data.top || requestedTop),
-    fetchedRows: data.rows,
-    replaceCache: !canFetchIncrementally,
-  };
+  return fetchLeaderboardRefresh(top, true);
 }
 
 async function refreshLeaderboardHistory(top = state.leaderboards.displayLimit, loadAll = false) {
@@ -5125,17 +5127,21 @@ async function refreshLeaderboardHistory(top = state.leaderboards.displayLimit, 
   renderLeaderboardTimeline();
 }
 
+let leaderboardRefreshPending = false;
 async function refreshLeaderboards() {
+  if (leaderboardRefreshPending) return;
+  leaderboardRefreshPending = true;
   els.leaderboardsSection.setAttribute("aria-busy", "true");
   els.leaderboardStatus.textContent = state.leaderboards.fetchedAt ? "Refreshing rankings…" : "Loading live rankings…";
   const requestedTop = state.leaderboards.displayLimit;
   const historyGeneration = ++leaderboardHistoryRequestGeneration;
   const loadAll = state.leaderboards.timelineRange === "all";
-  const [currentResult, historyResult] = await Promise.allSettled([
-    fetchJSON(`${API}/v1/leaderboard`),
-    loadAll ? fetchCompleteLeaderboardHistory(requestedTop) : fetchRecentLeaderboardHistory(requestedTop),
-    loadLeaderboardPlayerColors(),
+  const [historyResult] = await Promise.allSettled([
+    fetchLeaderboardRefresh(requestedTop, loadAll), loadLeaderboardPlayerColors(),
   ]);
+  const currentResult = historyResult.status === "fulfilled"
+    ? { status: "fulfilled", value: historyResult.value.latest } : historyResult;
+  leaderboardRefreshPending = false;
 
   let currentError = null;
   if (currentResult.status === "fulfilled") {
@@ -5610,7 +5616,7 @@ async function init() {
     return;
   }
   setInterval(refreshLive, POLL_MS);
-  setInterval(refreshLeaderboards, POLL_MS);
+  setInterval(refreshLeaderboards, LEADERBOARD_POLL_MS);
   setInterval(renderStatus, 30 * 1000);
 }
 

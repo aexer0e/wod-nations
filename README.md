@@ -36,3 +36,5 @@ npx serve .
 1. Push this folder to a GitHub repository.
 2. In the repo: **Settings → Pages → Source: Deploy from a branch**, pick the branch and `/ (root)`.
 3. Done — the site works from any path (all asset URLs are relative).
+
+Rankings refresh every two minutes through the combined public leaderboard endpoint. The website merges only new history captures after loading the selected range, and requests larger player lists only when needed. Map and health checks keep their independent five-minute interval. Public ranking requests omit the map session token.
